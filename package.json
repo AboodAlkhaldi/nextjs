@@ -1,0 +1,10 @@
+{
+  "name": "for-abood-root",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "cd for-abood && npm run dev",
+    "build": "cd for-abood && npm install && npm run build",
+    "start": "cd for-abood && npm run start"
+  }
+}

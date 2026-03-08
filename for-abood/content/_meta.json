@@ -2,5 +2,8 @@
   "index": "Introduction",
   "linux": "Linux",
   "aws": "AWS",
-  "kubernetes": "Kubernetes"
+  "kubernetes": "Kubernetes",
+  "Csharp_dotnet": "C# / .NET",
+  "ModularMonolith": "Modular Monolith",
+  "Azur": "Azure"
 }
