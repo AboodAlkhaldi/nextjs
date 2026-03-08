@@ -1,0 +1,1394 @@
+---
+title: Docker Reference
+sidebarTitle: Docker Reference
+---
+
+# Complete Docker Reference
+
+After memorizing and rewriting this reference, you can use Docker at almost any level.  
+Study it **section by section**; every command is documented with comments.
+
+---
+
+### Full shell / command cheatsheet
+
+The content below is kept as executable shell/script so you can copy‑paste directly into a terminal while practicing.
+
+```bash
+#!/usr/bin/env bash
+# =============================================================================
+# COMPLETE DOCKER REFERENCE - LEARN EVERYTHING IN ONE FILE
+# =============================================================================
+# After memorizing and rewriting this file, you can use Docker at ANY level.
+# Study section by section. Every command is explained with comments.
+# =============================================================================
+
+# ===========================================================================
+# SECTION 1: INSTALLATION & SETUP
+# ===========================================================================
+
+# Install Docker Engine (Ubuntu/Debian)
+curl -fsSL https://get.docker.com | bash           # Quick install script
+sudo apt-get install docker-ce docker-ce-cli        # Manual APT install
+sudo systemctl start docker                         # Start daemon
+sudo systemctl enable docker                        # Start on boot
+sudo systemctl status docker                        # Check status
+sudo usermod -aG docker $USER                       # Add user to docker group (no sudo needed)
+newgrp docker                                       # Apply group change without logout
+
+# Verify installation
+docker version                                      # Client & server version
+docker info                                         # System-wide info (containers, images, etc.)
+docker system df                                    # Disk usage overview
+
+# ===========================================================================
+# SECTION 2: IMAGES - BASICS
+# ===========================================================================
+
+# --- Search & Pull ---
+docker search nginx                                 # Search Docker Hub
+docker search --filter=stars=100 nginx              # Filter by stars
+docker pull nginx                                   # Pull latest tag
+docker pull nginx:1.25                              # Pull specific tag
+docker pull nginx:alpine                            # Pull alpine variant
+docker pull ubuntu:22.04                            # Pull with version
+docker pull myregistry.com/myimage:tag              # Pull from private registry
+
+# --- List images ---
+docker images                                       # List local images
+docker images -a                                    # Include intermediate layers
+docker images nginx                                 # Filter by name
+docker images --format "{{.Repository}}:{{.Tag}} {{.Size}}"  # Custom format
+docker images --filter "dangling=true"              # Untagged images (dangling)
+docker images --filter "before=nginx"               # Images created before nginx
+docker images --filter "since=ubuntu"               # Images created after ubuntu
+
+# --- Inspect & Info ---
+docker inspect nginx                                # Full JSON details of image
+docker inspect --format '{{.Config.Cmd}}' nginx     # Extract specific field
+docker history nginx                                # Layer history
+docker history --no-trunc nginx                     # Full commands (not truncated)
+
+# --- Tag & Push ---
+docker tag nginx:latest myrepo/mynginx:v1           # Tag image
+docker tag nginx:latest myrepo/mynginx:latest       # Multiple tags allowed
+docker push myrepo/mynginx:v1                       # Push to Docker Hub
+docker push myrepo/mynginx:latest
+docker push myregistry.com:5000/myimage:tag         # Push to private registry
+
+# --- Remove images ---
+docker rmi nginx                                    # Remove by name
+docker rmi nginx:1.25                               # Remove specific tag
+docker rmi abc123def456                             # Remove by image ID
+docker rmi -f nginx                                 # Force remove (even if container uses it)
+docker rmi $(docker images -q)                      # Remove ALL images
+docker image prune                                  # Remove dangling images
+docker image prune -a                               # Remove all unused images
+docker image prune -a --filter "until=24h"          # Unused images older than 24h
+
+# --- Save & Load (transfer images without registry) ---
+docker save nginx:latest -o nginx.tar               # Save image to tar file
+docker save nginx:latest | gzip > nginx.tar.gz      # Compressed
+docker load -i nginx.tar                            # Load image from tar
+docker load < nginx.tar.gz                          # From stdin
+
+# --- Import & Export (for containers, not images) ---
+docker export mycontainer -o container.tar          # Export container filesystem
+docker import container.tar myimage:latest          # Import as image
+
+# ===========================================================================
+# SECTION 3: CONTAINERS - LIFECYCLE
+# ===========================================================================
+
+# --- Run (create + start) ---
+docker run nginx                                    # Run in foreground (blocks terminal)
+docker run -d nginx                                 # Detached (background)
+docker run -it ubuntu bash                          # Interactive + TTY (for shells)
+docker run --name myapp nginx                       # Named container
+docker run --rm nginx                               # Auto-remove when stopped
+docker run -d --name web --restart always nginx     # Restart policy
+
+# --- Restart policies ---
+docker run --restart no nginx                       # Never restart (default)
+docker run --restart always nginx                   # Always restart
+docker run --restart on-failure nginx               # Restart on non-zero exit
+docker run --restart on-failure:3 nginx             # Max 3 restart attempts
+docker run --restart unless-stopped nginx           # Restart unless manually stopped
+
+# --- List containers ---
+docker ps                                           # Running containers
+docker ps -a                                        # All containers (including stopped)
+docker ps -q                                        # Only IDs
+docker ps -s                                        # With file sizes
+docker ps --filter "name=web"                       # Filter by name
+docker ps --filter "status=exited"                  # Filter by status
+docker ps --filter "ancestor=nginx"                 # Containers from image
+docker ps --format "{{.Names}}\t{{.Status}}\t{{.Ports}}"  # Custom format
+
+# --- Start, Stop, Restart, Pause ---
+docker start myapp                                  # Start stopped container
+docker stop myapp                                   # Graceful stop (SIGTERM, then SIGKILL)
+docker stop -t 30 myapp                             # 30s timeout before SIGKILL
+docker kill myapp                                   # Immediate SIGKILL
+docker kill -s SIGHUP myapp                         # Send specific signal
+docker restart myapp                                # Stop + start
+docker pause myapp                                  # Freeze container (SIGSTOP)
+docker unpause myapp                                # Resume container
+
+# --- Remove containers ---
+docker rm myapp                                     # Remove stopped container
+docker rm -f myapp                                  # Force remove running container
+docker rm $(docker ps -aq)                          # Remove ALL containers
+docker rm $(docker ps -aq --filter "status=exited") # Remove only stopped
+docker container prune                              # Remove all stopped containers
+docker container prune --filter "until=24h"         # Older than 24h
+
+# --- Inspect & Info ---
+docker inspect myapp                                # Full JSON details
+docker inspect --format '{{.State.Status}}' myapp  # Get status
+docker inspect --format '{{.NetworkSettings.IPAddress}}' myapp  # Get IP
+docker inspect --format '{{json .Config.Env}}' myapp | jq  # Env vars as JSON
+docker stats                                        # Live resource usage (all)
+docker stats myapp                                  # Live stats for one container
+docker stats --no-stream                            # One-time snapshot (no live)
+docker top myapp                                    # Running processes inside container
+docker port myapp                                   # Port mappings
+
+# ===========================================================================
+# SECTION 4: CONTAINER INTERACTION
+# ===========================================================================
+
+# --- Execute commands inside a running container ---
+docker exec myapp ls /var/www                       # Run command, exit
+docker exec -it myapp bash                          # Interactive shell in running container
+docker exec -it myapp sh                            # For alpine (no bash)
+docker exec -u root myapp whoami                    # Run as specific user
+docker exec -e MY_VAR=value myapp env               # Set env var for exec
+docker exec -w /tmp myapp ls                        # Set working directory
+
+# --- Logs ---
+docker logs myapp                                   # All logs
+docker logs -f myapp                                # Follow (tail -f)
+docker logs --tail 100 myapp                        # Last 100 lines
+docker logs --since 1h myapp                        # Logs from last hour
+docker logs --since "2024-01-01T00:00:00" myapp     # From timestamp
+docker logs --until "2024-01-02" myapp              # Until date
+docker logs -t myapp                                # Include timestamps
+docker logs 2>&1 myapp | grep "ERROR"               # Grep logs
+
+# --- Copy files between host and container ---
+docker cp myapp:/etc/nginx/nginx.conf ./nginx.conf  # Container -> Host
+docker cp ./nginx.conf myapp:/etc/nginx/nginx.conf  # Host -> Container
+docker cp myapp:/var/log/ ./logs/                   # Copy directory
+
+# --- Attach to container ---
+docker attach myapp                                 # Attach to running container's stdio
+# Detach without stopping: Ctrl+P, Ctrl+Q
+
+# --- Wait ---
+docker wait myapp                                   # Block until container stops, print exit code
+
+# ===========================================================================
+# SECTION 5: PORT MAPPING & NETWORKING
+# ===========================================================================
+
+# --- Port mapping (-p host:container) ---
+docker run -p 8080:80 nginx                         # Map host 8080 to container 80
+docker run -p 443:443 -p 80:80 nginx               # Multiple ports
+docker run -p 127.0.0.1:8080:80 nginx              # Bind to specific host IP
+docker run -P nginx                                 # Map ALL exposed ports to random host ports
+docker run -p 8080-8090:80 nginx                    # Range of host ports
+
+# --- Network drivers ---
+docker network ls                                   # List networks
+# Default networks:
+#   bridge  - default, containers communicate via bridge
+#   host    - container shares host network stack
+#   none    - no network
+
+docker run --network bridge nginx                   # Default
+docker run --network host nginx                     # Host networking (no port mapping needed)
+docker run --network none nginx                     # Isolated (no network)
+
+# --- Create custom networks ---
+docker network create mynet                         # Bridge network (default)
+docker network create --driver bridge mynet         # Explicit bridge
+docker network create --driver overlay mynet        # For Swarm multi-host
+docker network create --subnet 192.168.100.0/24 --gateway 192.168.100.1 mynet
+
+# --- Connect containers to networks ---
+docker run -d --name web --network mynet nginx
+docker run -d --name db --network mynet postgres
+
+# On custom network, containers reach each other by NAME:
+# web container can reach db with: psql -h db
+
+docker network connect mynet myapp                  # Connect running container to network
+docker network disconnect mynet myapp               # Disconnect
+
+# --- Inspect networks ---
+docker network inspect mynet                        # Full details
+docker network inspect bridge                       # See who's on bridge
+
+# --- Remove networks ---
+docker network rm mynet                             # Remove network
+docker network prune                                # Remove all unused networks
+
+# ===========================================================================
+# SECTION 6: VOLUMES & STORAGE
+# ===========================================================================
+
+# --- Types of mounts ---
+# 1. Named volumes     (managed by Docker, best for persistent data)
+# 2. Bind mounts       (map host path to container path, best for dev)
+# 3. tmpfs mounts      (in memory, temporary, not persisted)
+
+# --- Named volumes ---
+docker volume create mydata                         # Create named volume
+docker volume ls                                    # List volumes
+docker volume inspect mydata                        # Details (mount point, etc.)
+docker volume rm mydata                             # Remove volume
+docker volume prune                                 # Remove all unused volumes
+
+# Use named volume
+docker run -v mydata:/var/lib/mysql mysql           # -v name:path
+docker run --mount type=volume,source=mydata,target=/var/lib/mysql mysql  # Explicit syntax
+
+# --- Bind mounts (host path:container path) ---
+docker run -v /host/path:/container/path nginx      # Read-write
+docker run -v /host/path:/container/path:ro nginx   # Read-only
+docker run -v $(pwd):/app node                      # Current directory (dev)
+docker run -v $(pwd)/src:/app/src:ro node           # Specific subdir, read-only
+
+# Explicit bind mount syntax
+docker run --mount type=bind,source=/host/path,target=/container/path nginx
+docker run --mount type=bind,source=/host/path,target=/container/path,readonly nginx
+
+# --- tmpfs mounts (memory, not persisted) ---
+docker run --tmpfs /tmp nginx
+docker run --mount type=tmpfs,target=/tmp,tmpfs-size=100m nginx
+
+# --- Volumes in practice ---
+# Backup a volume
+docker run --rm -v mydata:/data -v $(pwd):/backup ubuntu \
+    tar czf /backup/mydata_backup.tar.gz /data
+
+# Restore a volume
+docker run --rm -v mydata:/data -v $(pwd):/backup ubuntu \
+    tar xzf /backup/mydata_backup.tar.gz -C /
+
+# Copy data between volumes
+docker run --rm -v vol1:/from -v vol2:/to ubuntu cp -av /from/. /to/
+
+# ===========================================================================
+# SECTION 7: ENVIRONMENT VARIABLES
+# ===========================================================================
+
+# Pass env vars
+docker run -e MY_VAR=value nginx                    # Single var
+docker run -e MY_VAR=value -e OTHER=123 nginx       # Multiple vars
+docker run -e MY_VAR nginx                          # Use current shell's value of MY_VAR
+docker run --env-file .env nginx                    # From .env file
+
+# .env file format:
+# MY_VAR=value
+# DB_HOST=localhost
+# DB_PORT=5432
+# DB_PASSWORD=secret
+
+# View env vars in container
+docker exec myapp env
+docker exec myapp printenv MY_VAR
+docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' myapp
+
+# ===========================================================================
+# SECTION 8: DOCKERFILE - COMPLETE REFERENCE
+# ===========================================================================
+
+# ----- Basic Dockerfile -----
+cat > Dockerfile << 'DOCKERFILE'
+# FROM: base image (MUST be first instruction, except ARG)
+FROM ubuntu:22.04
+
+# Maintainer label (modern way)
+LABEL maintainer="you@example.com"
+LABEL version="1.0"
+LABEL description="My app"
+
+# ARG: build-time variable (available during build only)
+ARG APP_VERSION=1.0
+ARG BUILD_DATE
+
+# ENV: environment variable (available at build AND runtime)
+ENV APP_HOME=/app
+ENV PORT=8080
+ENV NODE_ENV=production
+ENV PATH="$APP_HOME/bin:$PATH"
+
+# RUN: execute commands during build (each RUN = new layer)
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    vim \
+    && rm -rf /var/lib/apt/lists/*   # Clean up to reduce layer size
+
+# Combine multiple RUN commands to reduce layers!
+RUN useradd -ms /bin/bash appuser
+
+# WORKDIR: set working directory (creates if not exists)
+WORKDIR /app
+
+# COPY: copy files from build context to image
+COPY . .                                # Copy everything
+COPY package.json package-lock.json ./  # Copy specific files
+COPY src/ ./src/                        # Copy directory
+COPY --chown=appuser:appuser . .        # With ownership
+
+# ADD: like COPY but also handles URLs and tar extraction
+ADD https://example.com/file.tar.gz /tmp/   # Download and extract
+ADD myarchive.tar.gz /app/                   # Auto-extract tar
+# PREFER COPY over ADD unless you need ADD's special features
+
+# USER: switch to this user for subsequent instructions
+USER appuser
+
+# RUN after USER switch runs as that user
+RUN mkdir -p /app/logs
+
+# EXPOSE: document which ports the container listens on (does NOT actually publish)
+EXPOSE 8080
+EXPOSE 8080/tcp
+EXPOSE 53/udp
+
+# VOLUME: create a mount point (data here persists/is shareable)
+VOLUME ["/app/data"]
+VOLUME /app/logs
+
+# HEALTHCHECK: check if container is healthy
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:$PORT/health || exit 1
+
+# HEALTHCHECK NONE  # Disable inherited healthcheck
+
+# ONBUILD: instructions triggered when this image is used as base
+ONBUILD COPY . /app
+ONBUILD RUN npm install
+
+# STOPSIGNAL: signal to stop container (default SIGTERM)
+STOPSIGNAL SIGTERM
+
+# SHELL: change default shell for RUN/CMD/ENTRYPOINT
+SHELL ["/bin/bash", "-c"]
+
+# CMD: default command to run (can be overridden by docker run args)
+# Form 1 - exec form (PREFERRED): no shell, no variable expansion
+CMD ["nginx", "-g", "daemon off;"]
+
+# Form 2 - shell form: runs in /bin/sh -c
+CMD nginx -g 'daemon off;'
+
+# Form 3 - as arguments to ENTRYPOINT
+CMD ["--config", "/etc/app/config.yaml"]
+
+# ENTRYPOINT: main executable (CMD becomes its arguments)
+# Exec form (PREFERRED)
+ENTRYPOINT ["python3", "app.py"]
+
+# Shell form (harder to override)
+ENTRYPOINT python3 app.py
+DOCKERFILE
+
+# ----- CMD vs ENTRYPOINT -----
+# CMD alone:       docker run myimage              -> runs CMD
+#                  docker run myimage ls -la        -> REPLACES CMD with ls -la
+# ENTRYPOINT alone: docker run myimage             -> runs ENTRYPOINT
+#                   docker run myimage ls -la       -> APPENDS ls -la as args
+# BOTH:            docker run myimage              -> ENTRYPOINT + CMD as default args
+#                  docker run myimage --port 9090   -> ENTRYPOINT + --port 9090
+
+# ----- Multi-stage build -----
+cat > Dockerfile.multistage << 'DOCKERFILE'
+# Stage 1: Build
+FROM node:18-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+RUN npm run build
+
+# Stage 2: Runtime (much smaller image)
+FROM nginx:alpine AS runtime
+COPY --from=builder /app/dist /usr/share/nginx/html
+COPY --from=builder /app/nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+DOCKERFILE
+
+# ----- Efficient Dockerfile patterns -----
+cat > Dockerfile.optimized << 'DOCKERFILE'
+FROM node:18-alpine
+
+# 1. Create non-root user early
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+WORKDIR /app
+
+# 2. Copy dependency files FIRST (better cache utilization)
+# If package.json doesn't change, this layer is cached
+COPY package*.json ./
+RUN npm ci --only=production && npm cache clean --force
+
+# 3. Copy source code after dependencies (changes more often)
+COPY --chown=appuser:appgroup . .
+
+# 4. Switch to non-root user
+USER appuser
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s \
+    CMD wget -qO- http://localhost:3000/health || exit 1
+
+CMD ["node", "server.js"]
+DOCKERFILE
+
+# ===========================================================================
+# SECTION 9: BUILD - docker build
+# ===========================================================================
+
+docker build .                                      # Build from current dir
+docker build -t myapp:latest .                      # Tag the image
+docker build -t myapp:v1 -t myapp:latest .          # Multiple tags
+docker build -f Dockerfile.prod .                   # Custom Dockerfile name
+docker build -f /path/to/Dockerfile /build/context  # Custom context path
+docker build --no-cache .                           # Ignore build cache
+docker build --pull .                               # Always pull newer base image
+docker build --build-arg APP_VERSION=2.0 .          # Pass build-time variable
+docker build --build-arg APP_VERSION=2.0 --build-arg ENV=prod .
+docker build --target builder .                     # Build specific stage (multi-stage)
+docker build --platform linux/amd64 .              # Build for specific platform
+docker build --platform linux/amd64,linux/arm64 .  # Multi-platform build
+docker build -q .                                   # Quiet (only print image ID)
+docker build --progress=plain .                     # Full build output (no TTY collapsing)
+docker build --squash .                             # Squash all layers into one (experimental)
+docker build --memory 512m .                        # Limit build memory
+docker build --ssh default .                        # Forward SSH agent to build
+
+# Build context tips:
+# .dockerignore file controls what is sent to build context
+cat > .dockerignore << 'EOF'
+node_modules
+.git
+.gitignore
+*.log
+*.md
+dist
+coverage
+.env
+.env.*
+Dockerfile*
+docker-compose*
+README.md
+EOF
+
+# ===========================================================================
+# SECTION 10: DOCKER COMPOSE - COMPLETE REFERENCE
+# ===========================================================================
+
+# --- docker-compose.yml full reference ---
+cat > docker-compose.yml << 'YAML'
+version: "3.9"   # Compose file format version
+
+services:
+
+  # ---- Web service ----
+  web:
+    image: nginx:alpine                         # Use existing image
+    # OR build from Dockerfile:
+    build:
+      context: ./frontend                       # Build context directory
+      dockerfile: Dockerfile.prod               # Dockerfile name
+      args:                                     # Build arguments
+        NODE_ENV: production
+        APP_VERSION: 1.0
+      target: runtime                           # Multi-stage build target
+      cache_from:                               # Cache sources
+        - myrepo/myapp:latest
+
+    container_name: my_web                      # Override auto-generated name
+    hostname: webserver                         # Container hostname
+
+    restart: unless-stopped                     # Restart policy
+    # Options: no | always | on-failure | on-failure:3 | unless-stopped
+
+    ports:
+      - "80:80"                                 # host:container
+      - "443:443"
+      - "127.0.0.1:8080:80"                    # Bind to specific host IP
+      - "8080-8090:80"                          # Port range
+
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro  # Bind mount (ro = read-only)
+      - webdata:/var/www/html                   # Named volume
+      - type: bind                              # Explicit syntax
+        source: ./config
+        target: /etc/app
+        read_only: true
+      - type: volume
+        source: mydata
+        target: /data
+
+    environment:
+      - NODE_ENV=production                     # List format
+      - PORT=8080
+    # OR map format:
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      API_URL: http://api:3000
+
+    env_file:
+      - .env                                    # Load from file
+      - .env.production
+
+    networks:
+      - frontend
+      - backend
+
+    depends_on:
+      db:
+        condition: service_healthy              # Wait for healthy status
+      redis:
+        condition: service_started              # Just wait for start
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+      # disable: true                           # Disable healthcheck
+
+    deploy:                                     # Swarm mode settings
+      replicas: 3
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      update_config:
+        parallelism: 2
+        delay: 10s
+        order: rolling-update
+
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.web.rule=Host(`example.com`)"
+
+    logging:
+      driver: "json-file"                       # Log driver
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Other drivers: syslog, fluentd, awslogs, gelf, none
+
+    stdin_open: true                            # -i (interactive)
+    tty: true                                   # -t (TTY)
+
+    user: "1000:1000"                           # user:group
+    working_dir: /app
+    command: ["node", "server.js"]              # Override CMD
+    entrypoint: ["/entrypoint.sh"]             # Override ENTRYPOINT
+
+    extra_hosts:
+      - "somehost:192.168.1.100"               # Add to /etc/hosts
+
+    sysctls:
+      net.core.somaxconn: 1024
+
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    cap_add:
+      - SYS_PTRACE
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:seccomp_profile.json
+
+    privileged: false                           # Root-level access (avoid!)
+    read_only: true                             # Read-only filesystem
+
+    tmpfs:
+      - /tmp
+      - /run
+
+    init: true                                  # Use tini init system
+    
+    stop_grace_period: 30s                      # Timeout before SIGKILL
+
+    profiles:
+      - development                             # Only start with --profile development
+
+  # ---- API service ----
+  api:
+    build: ./backend
+    ports:
+      - "3000"                                  # Random host port
+    environment:
+      DATABASE_URL: postgres://user:pass@db:5432/mydb
+      REDIS_URL: redis://redis:6379
+    networks:
+      - backend
+    depends_on:
+      - db
+      - redis
+
+  # ---- Database service ----
+  db:
+    image: postgres:15-alpine
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    environment:
+      POSTGRES_DB: mydb
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: secret
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d mydb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- Redis service ----
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --requirepass secret
+    volumes:
+      - redisdata:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "--pass", "secret", "ping"]
+      interval: 10s
+      retries: 5
+
+# ---- Networks ----
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true                              # No external access
+  external_net:
+    external: true                              # Use pre-existing network
+    name: my_existing_network
+
+# ---- Volumes ----
+volumes:
+  pgdata:                                       # Docker-managed volume
+  redisdata:
+  webdata:
+    driver: local                               # Default driver
+  nfsdata:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=192.168.1.100,rw"
+      device: ":/path/on/nfs/server"
+  external_vol:
+    external: true                              # Pre-existing volume
+    name: my_existing_volume
+YAML
+
+# ===========================================================================
+# SECTION 11: DOCKER COMPOSE COMMANDS
+# ===========================================================================
+
+docker compose up                               # Start all services (foreground)
+docker compose up -d                            # Detached (background)
+docker compose up --build                       # Rebuild images before starting
+docker compose up --force-recreate              # Recreate containers even if unchanged
+docker compose up --no-deps web                 # Start without dependencies
+docker compose up --scale web=3                 # Start 3 replicas of web
+docker compose up web db                        # Start specific services only
+
+docker compose down                             # Stop and remove containers, networks
+docker compose down -v                          # Also remove named volumes
+docker compose down --rmi all                   # Also remove images
+docker compose down --remove-orphans            # Remove containers not in compose file
+
+docker compose start                            # Start existing containers
+docker compose stop                             # Stop without removing
+docker compose restart                          # Restart all services
+docker compose restart web                      # Restart specific service
+
+docker compose ps                               # List containers
+docker compose ps -a                            # Include stopped
+docker compose top                              # Running processes
+
+docker compose logs                             # All logs
+docker compose logs -f                          # Follow logs
+docker compose logs web                         # Specific service
+docker compose logs -f --tail=50 web            # Follow last 50 lines
+
+docker compose exec web bash                    # Shell in running container
+docker compose exec -it db psql -U user mydb   # Execute command
+
+docker compose run --rm web npm test            # Run one-off command (new container)
+docker compose run --rm --no-deps web bash      # Without starting dependencies
+
+docker compose build                            # Build all images
+docker compose build web                        # Build specific service
+docker compose build --no-cache                 # Ignore cache
+docker compose build --pull                     # Pull newer base images
+
+docker compose pull                             # Pull all images
+docker compose push                             # Push all built images
+
+docker compose config                           # Validate and view final config
+docker compose config --services                # List service names
+
+docker compose images                           # List images used
+docker compose events                           # Real-time events stream
+
+docker compose cp web:/app/logs ./logs          # Copy from service container
+docker compose cp ./data web:/app/data          # Copy to service container
+
+# Multiple compose files (later files override earlier)
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+# Use profiles
+docker compose --profile development up
+
+# ===========================================================================
+# SECTION 12: DOCKER REGISTRY
+# ===========================================================================
+
+# --- Login / Logout ---
+docker login                                    # Docker Hub (interactive)
+docker login -u myuser -p mypassword            # With credentials (insecure!)
+echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USER" --password-stdin  # Secure
+docker login myregistry.com:5000               # Private registry
+docker logout                                   # Logout from Docker Hub
+docker logout myregistry.com                   # Logout from specific registry
+
+# --- Run a local private registry ---
+docker run -d -p 5000:5000 --name registry registry:2
+docker run -d -p 5000:5000 \
+    -v /mnt/registry:/var/lib/registry \
+    --restart always \
+    --name registry \
+    registry:2
+
+# Push to local registry
+docker tag myimage localhost:5000/myimage
+docker push localhost:5000/myimage
+docker pull localhost:5000/myimage
+
+# --- Registry with authentication ---
+docker run -d -p 5000:5000 \
+    -v /mnt/registry:/var/lib/registry \
+    -v /auth:/auth \
+    -e REGISTRY_AUTH=htpasswd \
+    -e REGISTRY_AUTH_HTPASSWD_REALM="Registry" \
+    -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
+    registry:2
+
+# ===========================================================================
+# SECTION 13: DOCKER SYSTEM MANAGEMENT
+# ===========================================================================
+
+# --- System info ---
+docker info                                     # Full system info
+docker version                                  # Version details
+docker system df                                # Disk usage summary
+docker system df -v                             # Verbose disk usage
+
+# --- Cleanup (IMPORTANT) ---
+docker system prune                             # Remove: stopped containers, dangling images, unused networks
+docker system prune -a                          # Also remove all unused images
+docker system prune -a --volumes               # Also remove volumes
+docker system prune -a -f                       # Force, no confirmation prompt
+docker system prune -a --filter "until=720h"   # Only items older than 30 days
+
+# Individual pruning
+docker container prune                          # Remove stopped containers
+docker image prune                              # Remove dangling images
+docker image prune -a                           # Remove ALL unused images
+docker volume prune                             # Remove unused volumes
+docker network prune                            # Remove unused networks
+
+# --- Events ---
+docker events                                   # Real-time events
+docker events --filter "type=container"         # Container events only
+docker events --filter "event=start"            # Start events only
+docker events --since "1h"                      # Events from last hour
+docker events --filter "container=myapp"        # For specific container
+
+# --- Context (managing multiple Docker hosts) ---
+docker context ls                               # List contexts
+docker context create remote --docker "host=ssh://user@remote-server"
+docker context use remote                       # Switch to remote Docker
+docker context use default                      # Switch back to local
+docker context inspect remote
+
+# ===========================================================================
+# SECTION 14: DOCKER NETWORKING IN DEPTH
+# ===========================================================================
+
+# --- DNS in Docker ---
+# On custom networks, containers resolve each other by SERVICE/CONTAINER name
+# Bridge network uses Docker's embedded DNS server
+
+# Test DNS resolution
+docker run --rm --network mynet alpine nslookup web
+docker run --rm --network mynet alpine ping db
+
+# --- Connecting to host services from container ---
+# Linux: use host.docker.internal (newer Docker) or the docker0 bridge IP
+docker run --rm alpine curl http://host.docker.internal:8080
+# Or add --add-host:
+docker run --add-host=host.docker.internal:host-gateway alpine curl http://host.docker.internal:3000
+
+# --- Network troubleshooting ---
+docker run --rm --network mynet nicolaka/netshoot nmap -p 1-65535 web
+docker run --rm --network mynet alpine wget -qO- http://web:80
+
+# ===========================================================================
+# SECTION 15: SECURITY
+# ===========================================================================
+
+# --- Run as non-root ---
+docker run --user 1000:1000 nginx               # Specify UID:GID
+docker run --user nobody nginx                  # By name
+
+# --- Read-only filesystem ---
+docker run --read-only nginx
+docker run --read-only --tmpfs /tmp nginx       # Allow writes to /tmp only
+
+# --- Drop capabilities ---
+docker run --cap-drop ALL nginx                 # Drop all capabilities
+docker run --cap-drop ALL --cap-add NET_BIND_SERVICE nginx  # Add back only needed ones
+
+# --- Security options ---
+docker run --security-opt no-new-privileges nginx      # Prevent privilege escalation
+docker run --security-opt apparmor=docker-default nginx
+docker run --security-opt seccomp=seccomp.json nginx
+
+# --- Resource limits ---
+docker run --memory 512m nginx                  # Memory limit
+docker run --memory 512m --memory-swap 1g nginx # Memory + swap
+docker run --memory-reservation 256m nginx      # Soft limit
+docker run --cpus 1.5 nginx                     # CPU cores (1.5 = 1.5 cores)
+docker run --cpu-shares 512 nginx               # Relative CPU weight (default 1024)
+docker run --cpu-period 100000 --cpu-quota 50000 nginx  # 50% of one core
+docker run --pids-limit 100 nginx               # Max processes
+docker run --ulimit nofile=1024:1024 nginx      # File descriptor limit
+docker run --device-read-bps /dev/sda:10mb nginx  # I/O limits
+
+# --- Secrets (Docker Swarm) ---
+echo "mypassword" | docker secret create db_password -
+docker secret ls
+docker secret inspect db_password
+docker secret rm db_password
+
+# In compose for swarm:
+# secrets:
+#   db_password:
+#     external: true
+
+# ===========================================================================
+# SECTION 16: DOCKER SWARM (ORCHESTRATION)
+# ===========================================================================
+
+# --- Init and join ---
+docker swarm init                               # Init swarm (current node becomes manager)
+docker swarm init --advertise-addr 192.168.1.10 # Specify address
+docker swarm join-token worker                  # Print worker join token
+docker swarm join-token manager                 # Print manager join token
+docker swarm join --token TOKEN 192.168.1.10:2377  # Join as worker
+docker swarm leave                              # Leave swarm (worker)
+docker swarm leave --force                      # Leave swarm (manager)
+
+# --- Nodes ---
+docker node ls                                  # List nodes
+docker node inspect mynode
+docker node update --availability drain mynode  # Drain (stop scheduling new tasks)
+docker node update --availability active mynode # Make available again
+docker node promote mynode                      # Promote to manager
+docker node demote mynode                       # Demote to worker
+docker node rm mynode                           # Remove node
+
+# --- Services (Swarm containers) ---
+docker service create --name web --replicas 3 -p 80:80 nginx
+docker service ls                               # List services
+docker service ps web                          # List tasks (containers) of a service
+docker service inspect web                     # Details
+docker service logs web                        # Logs
+docker service logs -f web                     # Follow
+docker service scale web=5                     # Scale to 5 replicas
+docker service update --image nginx:1.25 web   # Rolling update
+docker service update --replicas 5 web
+docker service update --env-add NEW_VAR=value web
+docker service update --publish-add 8080:80 web
+docker service update --rollback web           # Rollback to previous state
+docker service rm web                          # Remove service
+
+# --- Stacks (Swarm's version of Compose) ---
+docker stack deploy -c docker-compose.yml mystack   # Deploy stack
+docker stack ls                                      # List stacks
+docker stack services mystack                        # Services in stack
+docker stack ps mystack                              # Tasks in stack
+docker stack rm mystack                              # Remove stack
+
+# ===========================================================================
+# SECTION 17: DOCKER BUILDX (ADVANCED BUILDS)
+# ===========================================================================
+
+docker buildx version                           # Version
+docker buildx ls                                # List builders
+docker buildx create --name mybuilder --use    # Create and use new builder
+docker buildx inspect --bootstrap mybuilder    # Init and inspect builder
+docker buildx rm mybuilder                     # Remove builder
+
+# Build for multiple platforms
+docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 \
+    -t myrepo/myimage:latest \
+    --push .                                   # Push directly to registry
+
+# Build and load into local Docker (single platform only)
+docker buildx build --platform linux/amd64 -t myimage --load .
+
+# Build with inline cache
+docker buildx build \
+    --cache-from type=registry,ref=myrepo/myimage:cache \
+    --cache-to type=registry,ref=myrepo/myimage:cache,mode=max \
+    -t myrepo/myimage:latest --push .
+
+# ===========================================================================
+# SECTION 18: MONITORING & DEBUGGING
+# ===========================================================================
+
+# --- Real-time stats ---
+docker stats                                    # All containers
+docker stats myapp db redis                     # Specific containers
+docker stats --no-stream                        # Snapshot (not live)
+docker stats --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+
+# --- Container details ---
+docker inspect myapp                            # Everything
+docker inspect myapp | jq '.[0].State'         # Filter with jq
+docker inspect -f '{{.State.Health.Status}}' myapp   # Health status
+docker inspect -f '{{range .Mounts}}{{.Source}}:{{.Destination}}\n{{end}}' myapp
+
+# --- Debugging techniques ---
+# Get a shell in a running container
+docker exec -it myapp bash
+
+# Get a shell in a STOPPED container
+docker run -it --entrypoint bash myimage       # Override entrypoint
+
+# Debug with a different image sharing the namespace
+docker run -it --pid=container:myapp --net=container:myapp \
+    --cap-add sys_ptrace nicolaka/netshoot bash
+
+# Debug with docker debug (newer feature)
+docker debug myapp
+
+# Inspect filesystem layers
+docker run --rm -it -v /var/lib/docker:/var/lib/docker:ro ubuntu bash
+# Then navigate to /var/lib/docker/overlay2/
+
+# Diff: see what changed in container vs image
+docker diff myapp                              # A=added, C=changed, D=deleted
+
+# --- Logs ---
+docker logs myapp
+docker logs -f myapp                           # Follow
+docker logs --tail 50 myapp
+docker logs --since 1h myapp
+docker logs --until 30m myapp
+docker logs -t myapp                           # Timestamps
+
+# Log drivers
+docker run --log-driver syslog myapp
+docker run --log-driver json-file --log-opt max-size=10m --log-opt max-file=3 myapp
+docker run --log-driver none myapp             # No logging
+
+# ===========================================================================
+# SECTION 19: USEFUL PATTERNS & REAL-WORLD EXAMPLES
+# ===========================================================================
+
+# --- Pattern 1: Run a temporary tool container ---
+docker run --rm -v $(pwd):/work -w /work node:18-alpine npm install
+docker run --rm -v $(pwd):/docs -w /docs pandoc/latex doc.md -o doc.pdf
+docker run --rm -v $(pwd):/app composer install
+
+# --- Pattern 2: Database with initialization ---
+docker run -d \
+    --name postgres \
+    -e POSTGRES_DB=mydb \
+    -e POSTGRES_USER=user \
+    -e POSTGRES_PASSWORD=secret \
+    -v pgdata:/var/lib/postgresql/data \
+    -v $(pwd)/init.sql:/docker-entrypoint-initdb.d/init.sql \
+    -p 5432:5432 \
+    postgres:15-alpine
+
+# --- Pattern 3: Database backup ---
+docker exec postgres pg_dump -U user mydb > backup_$(date +%Y%m%d).sql
+docker exec postgres pg_dumpall -U user > full_backup.sql
+
+# Restore
+cat backup.sql | docker exec -i postgres psql -U user mydb
+
+# --- Pattern 4: Wait for service to be ready ---
+wait_for_postgres() {
+    until docker exec postgres pg_isready -U user; do
+        echo "Waiting for postgres..."
+        sleep 2
+    done
+    echo "Postgres is ready!"
+}
+
+# --- Pattern 5: Run X11/GUI apps in Docker ---
+docker run -it --rm \
+    -e DISPLAY=$DISPLAY \
+    -v /tmp/.X11-unix:/tmp/.X11-unix \
+    firefox
+
+# --- Pattern 6: Rootless Docker ---
+# Install rootless
+dockerd-rootless-setuptool.sh install
+# Use
+export DOCKER_HOST=unix:///run/user/1000/docker.sock
+docker run hello-world
+
+# --- Pattern 7: Docker in CI/CD ---
+# Build, test, push in one pipeline
+set -e
+IMAGE="myrepo/myapp"
+TAG="${CI_COMMIT_SHA:-latest}"
+
+docker build -t "$IMAGE:$TAG" .
+docker run --rm "$IMAGE:$TAG" npm test
+docker tag "$IMAGE:$TAG" "$IMAGE:latest"
+echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USER" --password-stdin
+docker push "$IMAGE:$TAG"
+docker push "$IMAGE:latest"
+
+# --- Pattern 8: Health check in entrypoint ---
+cat > docker-healthcheck.sh << 'EOF'
+#!/bin/sh
+curl -fs http://localhost:${PORT:-8080}/health || exit 1
+EOF
+
+# --- Pattern 9: Dynamic container management ---
+# Stop containers matching a pattern
+docker ps -q --filter "name=worker_" | xargs -r docker stop
+
+# Remove containers older than 24h
+docker ps -a --filter "status=exited" \
+    --filter "until=24h" -q | xargs -r docker rm
+
+# Get IP of container
+docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' myapp
+
+# ===========================================================================
+# SECTION 20: DOCKER FORMAT TEMPLATES
+# ===========================================================================
+
+# Go templates for --format flag
+docker ps --format "{{.Names}}"
+docker ps --format "{{.Names}}: {{.Status}}"
+docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+docker images --format "{{.Repository}}:{{.Tag}}\t{{.Size}}"
+docker images --format "{{json .}}"                # Full JSON per item
+
+# Available fields for docker ps:
+# .ID .Image .Command .CreatedAt .RunningFor .Ports .Status
+# .Size .Names .Labels .Mounts .Networks
+
+# Available fields for docker images:
+# .ID .Repository .Tag .Digest .CreatedSince .CreatedAt .Size
+
+# ===========================================================================
+# SECTION 21: .env FILE & ENVIRONMENT MANAGEMENT
+# ===========================================================================
+
+# .env file for compose
+cat > .env << 'EOF'
+# Application
+APP_NAME=myapp
+APP_ENV=production
+APP_PORT=8080
+
+# Database
+DB_HOST=db
+DB_PORT=5432
+DB_NAME=mydb
+DB_USER=user
+DB_PASSWORD=supersecret
+
+# Redis
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_PASSWORD=redissecret
+
+# Image versions
+NGINX_VERSION=alpine
+POSTGRES_VERSION=15-alpine
+NODE_VERSION=18-alpine
+EOF
+
+# Use variables in docker-compose.yml
+# image: nginx:${NGINX_VERSION}
+# environment:
+#   - DB_PASSWORD=${DB_PASSWORD}
+
+# Multiple environments
+docker compose --env-file .env.production up -d
+docker compose --env-file .env.staging up -d
+
+# ===========================================================================
+# SECTION 22: DOCKERFILE BEST PRACTICES SUMMARY
+# ===========================================================================
+
+cat > Dockerfile.best_practices << 'DOCKERFILE'
+# 1. Use specific image tags, not :latest
+FROM node:18.17.0-alpine3.18
+
+# 2. Create non-root user early
+RUN addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
+
+# 3. Install only what you need, clean up in same layer
+RUN apk add --no-cache \
+    curl \
+    dumb-init
+
+# 4. Copy dependency files before source code (better caching)
+WORKDIR /app
+COPY package*.json ./
+
+# 5. Use npm ci for reproducible installs
+RUN npm ci --only=production && npm cache clean --force
+
+# 6. Copy source after dependencies
+COPY --chown=nodejs:nodejs . .
+
+# 7. Switch to non-root user
+USER nodejs
+
+# 8. Use EXPOSE for documentation
+EXPOSE 3000
+
+# 9. Add healthcheck
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
+    CMD node healthcheck.js
+
+# 10. Use exec form for CMD/ENTRYPOINT
+# 11. Use dumb-init for proper signal handling
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+CMD ["node", "server.js"]
+DOCKERFILE
+
+# ===========================================================================
+# SECTION 23: COMPLETE DOCKER COMPOSE STACK EXAMPLE
+# ===========================================================================
+
+cat > docker-compose.fullstack.yml << 'YAML'
+version: "3.9"
+
+x-common-env: &common-env                       # YAML anchor for reuse
+  TZ: UTC
+  LOG_LEVEL: info
+
+services:
+
+  traefik:                                       # Reverse proxy / load balancer
+    image: traefik:v2.10
+    command:
+      - --api.dashboard=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"                              # Dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./certs:/certs
+    networks:
+      - proxy
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NODE_ENV: production
+    environment:
+      <<: *common-env                            # Merge common env
+      DATABASE_URL: postgres://user:${DB_PASSWORD}@db:5432/mydb
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      PORT: 3000
+    env_file:
+      - .env
+    volumes:
+      - uploads:/app/uploads
+    networks:
+      - proxy
+      - backend
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.app.rule=Host(`app.example.com`)"
+      - "traefik.http.routers.app.tls=true"
+      - "traefik.http.services.app.loadbalancer.server.port=3000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: mydb
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d mydb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    volumes:
+      - redisdata:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --pass ${REDIS_PASSWORD} ping | grep PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: node worker.js
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgres://user:${DB_PASSWORD}@db:5432/mydb
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+    depends_on:
+      - db
+      - redis
+    networks:
+      - backend
+    restart: unless-stopped
+    profiles:
+      - production                               # Only with --profile production
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:
+
+networks:
+  proxy:
+    external: true                               # Created separately: docker network create proxy
+  backend:
+    driver: bridge
+    internal: true
+YAML
+
+# ===========================================================================
+# SECTION 24: QUICK REFERENCE CHEATSHEET
+# ===========================================================================
+#
+# IMAGES:
+#   docker pull IMAGE[:TAG]          Pull image
+#   docker build -t NAME .           Build image
+#   docker images                    List images
+#   docker rmi IMAGE                 Remove image
+#   docker image prune -a            Remove unused images
+#   docker save IMAGE | gzip > f.gz  Export image
+#   docker load < f.gz               Import image
+#
+# CONTAINERS:
+#   docker run -d --name N -p H:C IMAGE   Run detached
+#   docker run -it IMAGE bash             Interactive shell
+#   docker run --rm IMAGE command         Temporary container
+#   docker ps [-a]                        List containers
+#   docker start/stop/restart NAME        Lifecycle
+#   docker rm [-f] NAME                   Remove container
+#   docker exec -it NAME bash             Shell in running container
+#   docker logs [-f] NAME                 View logs
+#   docker cp SRC DEST                    Copy files
+#   docker inspect NAME                   Full details
+#   docker stats                          Resource usage
+#
+# VOLUMES:
+#   docker volume create V               Create volume
+#   docker volume ls / rm / prune        Manage volumes
+#   docker run -v V:/path IMAGE          Named volume
+#   docker run -v /host:/cont IMAGE      Bind mount
+#
+# NETWORKS:
+#   docker network create N              Create network
+#   docker network ls / rm / prune       Manage networks
+#   docker run --network N IMAGE         Use network
+#   docker network connect N CONTAINER   Connect container
+#
+# COMPOSE:
+#   docker compose up -d                 Start services
+#   docker compose down [-v]             Stop and remove
+#   docker compose build [--no-cache]    Build images
+#   docker compose logs [-f] [SERVICE]   View logs
+#   docker compose exec SERVICE CMD      Run command
+#   docker compose ps                    List containers
+#   docker compose scale S=N             Scale service
+#
+# SYSTEM:
+#   docker system df                     Disk usage
+#   docker system prune -a               Clean everything
+#   docker info                          System info
+#   docker events                        Real-time events
+```

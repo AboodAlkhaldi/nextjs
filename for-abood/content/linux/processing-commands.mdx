@@ -1,0 +1,3469 @@
+---
+sidebarTitle: Text Processing
+---
+
+# Linux Text Processing & Stream Manipulation: Deep Reference
+
+---
+
+## Table of Contents
+
+1. [Philosophy and Mental Model](#philosophy-and-mental-model)
+   - [Unix Streams](#unix-streams)
+   - [Redirection Operators](#redirection-operators)
+   - [Pipes and Composability](#pipes-and-composability)
+   - [Building Complex Pipelines Step by Step](#building-complex-pipelines-step-by-step)
+2. [Core Text Processing Tools](#core-text-processing-tools)
+   - [Basic Inspection](#basic-inspection): cat, less, head, tail, wc, file, stat
+   - [Filtering and Searching](#filtering-and-searching): grep, egrep, pgrep, find
+   - [Transformation](#transformation): sed, awk, cut, tr, paste, sort, uniq, column, expand/unexpand
+   - [JSON and Structured Data](#json-and-structured-data): jq, yq, base64, xargs
+   - [Comparison and Diffing](#comparison-and-diffing): diff, comm
+   - [Pipeline Helpers](#pipeline-helpers): tee, xargs, watch
+3. [Cloud/Platform Scenarios](#cloudplatform-scenarios)
+4. [Advanced Topics](#advanced-topics)
+5. [Practice Section](#practice-section)
+
+---
+
+## Philosophy and Mental Model
+
+### Unix Streams
+
+Every process in Linux inherits three open file descriptors at birth:
+
+| FD | Name   | Default Target | Purpose |
+|----|--------|----------------|---------|
+| 0  | stdin  | Terminal (keyboard) | Input stream — data the process reads |
+| 1  | stdout | Terminal (screen) | Output stream — normal results |
+| 2  | stderr | Terminal (screen) | Error stream — diagnostics, warnings, progress |
+
+These are **byte streams**, not typed objects. Every tool reads bytes from stdin, transforms them, and writes bytes to stdout. Errors and diagnostics go to stderr so they don't corrupt the data flowing through a pipeline.
+
+```bash
+# A process sees its file descriptors through /proc/self/fd
+ls -la /proc/self/fd
+# lrwx------ 1 root root 64 ... 0 -> /dev/pts/0   (stdin  = terminal)
+# lrwx------ 1 root root 64 ... 1 -> /dev/pts/0   (stdout = terminal)
+# lrwx------ 1 root root 64 ... 2 -> /dev/pts/0   (stderr = terminal)
+```
+
+Key insight: **stdout and stderr both go to the terminal by default, but they are separate streams.** When you pipe output, only stdout travels through the pipe. stderr still hits the terminal unless explicitly redirected.
+
+```bash
+# stderr is NOT captured by the pipe — the error still prints to terminal
+ls /nonexistent | grep "No"
+# ls: cannot access '/nonexistent': No such file or directory   <- this is stderr, goes to terminal
+# (grep sees nothing on stdin, produces no output)
+```
+
+### Redirection Operators
+
+Redirection changes where file descriptors point. The shell sets up redirections **before** the command runs.
+
+#### Output Redirection
+
+```bash
+# > : Redirect stdout to a file (truncate if exists, create if not)
+kubectl get pods -o wide > pods.txt
+
+# >> : Redirect stdout to a file (append, create if not)
+echo "Deploy completed at $(date)" >> deploy.log
+
+# 2> : Redirect stderr to a file
+terraform plan 2> tf-errors.log
+
+# 2>> : Redirect stderr, append
+ansible-playbook site.yml 2>> ansible-errors.log
+
+# &> : Redirect BOTH stdout and stderr to a file (bash-specific)
+docker build -t myapp:latest . &> build.log
+
+# Equivalent portable form (works in sh, dash, etc.)
+docker build -t myapp:latest . > build.log 2>&1
+```
+
+#### The `2>&1` Construct
+
+`2>&1` means "redirect file descriptor 2 (stderr) to wherever file descriptor 1 (stdout) currently points." Order matters:
+
+```bash
+# CORRECT: stdout goes to file, then stderr follows stdout to the same file
+command > output.log 2>&1
+
+# WRONG ORDER: stderr is redirected to stdout (still terminal at this point),
+# THEN stdout is redirected to file. stderr still goes to terminal.
+command 2>&1 > output.log
+```
+
+#### Input Redirection
+
+```bash
+# < : Redirect a file into stdin
+wc -l < /var/log/syslog
+
+# << : Here-document (multi-line string as stdin)
+cat <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+EOF
+
+# <<< : Here-string (single string as stdin, bash-specific)
+grep "error" <<< "this is an error message"
+```
+
+#### File Descriptor Manipulation
+
+```bash
+# Discard stdout (send to /dev/null)
+curl -s https://api.example.com > /dev/null
+
+# Discard stderr only
+find / -name "*.conf" 2>/dev/null
+
+# Discard both
+command > /dev/null 2>&1
+
+# Swap stdout and stderr (advanced)
+command 3>&1 1>&2 2>&3 3>&-
+
+# Open a file on FD 3 for writing
+exec 3> /tmp/custom.log
+echo "message" >&3     # writes to /tmp/custom.log
+exec 3>&-              # close FD 3
+```
+
+### Pipes and Composability
+
+The pipe operator `|` connects the stdout of the left command to the stdin of the right command. The kernel creates an in-memory buffer (pipe buffer, typically 64 KB on Linux) between them. Both commands run **concurrently** — the right side blocks when the buffer is empty, the left side blocks when the buffer is full.
+
+```bash
+# Each stage runs as a separate process, connected by kernel pipe buffers
+kubectl get pods --all-namespaces -o json | jq '.items[] | .metadata.name' | sort | uniq -c | sort -rn
+#  ^--- produces JSON on stdout          ^--- filters   ^--- sorts     ^--- counts  ^--- sorts numerically
+```
+
+**Key properties of pipes:**
+
+- Only stdout flows through the pipe. stderr bypasses it.
+- Each stage runs in its own subshell (in bash).
+- The exit status of a pipeline is the exit status of the **last** command (unless `set -o pipefail` is enabled).
+- Pipes are unidirectional — data flows left to right only.
+
+```bash
+# pipefail: fail the pipeline if ANY stage fails, not just the last
+set -o pipefail
+kubectl get pods -n production | grep "CrashLoopBackOff" | wc -l
+# Without pipefail: exit code is from wc (always 0)
+# With pipefail: exit code is from kubectl if it fails
+```
+
+#### Named Pipes (FIFOs)
+
+For cases where you need persistent pipe-like behavior between processes that don't share a pipeline:
+
+```bash
+mkfifo /tmp/logpipe
+# Terminal 1: writer
+tail -f /var/log/app.log > /tmp/logpipe
+# Terminal 2: reader
+grep "ERROR" < /tmp/logpipe
+```
+
+### Building Complex Pipelines Step by Step
+
+Never write a complex pipeline in one shot. Build iteratively, verifying each stage:
+
+```bash
+# Goal: Find the top 5 Kubernetes pods by restart count across all namespaces
+
+# Step 1: Get raw data
+kubectl get pods --all-namespaces -o json
+
+# Step 2: Extract relevant fields with jq
+kubectl get pods --all-namespaces -o json | \
+  jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name) \(.status.containerStatuses[]?.restartCount // 0)"'
+
+# Step 3: Sort numerically by the restart count (second field)
+kubectl get pods --all-namespaces -o json | \
+  jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name) \(.status.containerStatuses[]?.restartCount // 0)"' | \
+  sort -t' ' -k2 -rn
+
+# Step 4: Take the top 5
+kubectl get pods --all-namespaces -o json | \
+  jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name) \(.status.containerStatuses[]?.restartCount // 0)"' | \
+  sort -t' ' -k2 -rn | \
+  head -5
+
+# Step 5: Format as a clean table
+kubectl get pods --all-namespaces -o json | \
+  jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name) \(.status.containerStatuses[]?.restartCount // 0)"' | \
+  sort -t' ' -k2 -rn | \
+  head -5 | \
+  column -t
+```
+
+**Debugging pipelines:** Insert `tee /dev/stderr` between stages to see intermediate output without breaking the flow:
+
+```bash
+kubectl get pods -o json | \
+  jq '.items[].metadata.name' | \
+  tee /dev/stderr | \       # prints names to terminal AND passes them on
+  wc -l
+```
+
+---
+
+## Core Text Processing Tools
+
+### Basic Inspection
+
+---
+
+#### `cat` — Concatenate and Display
+
+Reads files sequentially and writes their contents to stdout. Despite its simplicity, it has useful flags for inspecting files with invisible characters.
+
+**Syntax:** `cat [OPTIONS] [FILE...]`
+
+```bash
+# Display a file
+cat /etc/os-release
+
+# Concatenate multiple files
+cat header.yaml body.yaml footer.yaml > full-manifest.yaml
+
+# Show line numbers (useful when referencing specific lines in reviews)
+cat -n /etc/nginx/nginx.conf
+
+# Show non-printing characters, tabs, and line endings
+# -A is equivalent to -vET
+cat -A script.sh
+# ^I = tab, $ = line ending, ^M = carriage return (Windows line endings)
+
+# Detect Windows line endings (^M characters at end of lines)
+cat -A Dockerfile | head -5
+# FROM node:18-alpine$          <- Unix line ending (clean)
+# FROM node:18-alpine^M$        <- Windows line ending (will break scripts)
+
+# Create a file from stdin (useful in Dockerfiles or scripts)
+cat > /tmp/test.conf <<EOF
+server {
+    listen 80;
+    server_name localhost;
+}
+EOF
+
+# Append to a file
+cat >> /etc/hosts <<EOF
+10.0.1.50 k8s-master
+10.0.1.51 k8s-worker-1
+EOF
+```
+
+**Common flags:**
+
+| Flag | Purpose |
+|------|---------|
+| `-n` | Number all lines |
+| `-b` | Number non-blank lines only |
+| `-s` | Squeeze multiple blank lines into one |
+| `-A` | Show all (equivalent to `-vET`) |
+| `-v` | Show non-printing characters |
+| `-E` | Show `$` at end of each line |
+| `-T` | Show tabs as `^I` |
+
+**Gotcha:** `cat file | grep pattern` is a **Useless Use of Cat (UUOC)**. Use `grep pattern file` directly. `cat` is for concatenation, not for feeding single files to other commands.
+
+---
+
+#### `less` — Paged File Viewer
+
+Interactive file viewer with search, scrolling, and filtering. Essential for exploring large log files without loading them entirely into memory.
+
+**Syntax:** `less [OPTIONS] [FILE]`
+
+```bash
+# View a large log file
+less /var/log/syslog
+
+# Follow a growing file (like tail -f, but with scroll-back)
+less +F /var/log/app.log
+# Press Ctrl+C to stop following, then scroll. Press F to resume following.
+
+# View with line numbers
+less -N /etc/kubernetes/manifests/kube-apiserver.yaml
+
+# Pipe into less for long command output
+kubectl describe pod my-pod | less
+
+# View compressed files directly
+less /var/log/syslog.1.gz    # uses lesspipe automatically
+```
+
+**Navigation within less:**
+
+| Key | Action |
+|-----|--------|
+| `Space` / `f` | Forward one screen |
+| `b` | Back one screen |
+| `g` | Go to first line |
+| `G` | Go to last line |
+| `/pattern` | Search forward |
+| `?pattern` | Search backward |
+| `n` / `N` | Next / previous search match |
+| `&pattern` | Show only lines matching pattern (filter mode) |
+| `q` | Quit |
+| `F` | Follow mode (like tail -f) |
+| `-i` then re-search | Toggle case-insensitive search |
+
+**Cloud use case:** When troubleshooting a large journal dump:
+
+```bash
+journalctl -u kubelet --since "1 hour ago" | less
+# Then use /OOMKilled to search, & to filter
+```
+
+---
+
+#### `head` — Display Beginning of Files
+
+**Syntax:** `head [OPTIONS] [FILE...]`
+
+```bash
+# First 10 lines (default)
+head /var/log/kern.log
+
+# First 30 lines
+head -n 30 /etc/passwd
+
+# First 500 bytes
+head -c 500 /var/log/binary.log
+
+# All lines EXCEPT the last 5 (negative count)
+head -n -5 data.csv       # useful for removing trailing lines/footers
+
+# Preview multiple files (head adds a header per file)
+head -n 3 /etc/*.conf
+
+# Quick look at a Terraform plan
+terraform plan -no-color | head -50
+```
+
+---
+
+#### `tail` — Display End of Files
+
+**Syntax:** `tail [OPTIONS] [FILE...]`
+
+```bash
+# Last 10 lines (default)
+tail /var/log/syslog
+
+# Last 50 lines
+tail -n 50 /var/log/nginx/error.log
+
+# Everything from line 100 onward (+ means "starting at")
+tail -n +100 app.log       # skip the first 99 lines
+
+# Follow a file in real-time (essential for log monitoring)
+tail -f /var/log/app.log
+
+# Follow and retry if the file is rotated (logrotate, container restarts)
+tail -F /var/log/app.log
+
+# Follow multiple files simultaneously
+tail -f /var/log/nginx/access.log /var/log/nginx/error.log
+
+# Follow with a specific number of initial lines
+tail -n 100 -f /var/log/app.log
+
+# Follow Kubernetes container logs
+kubectl logs -f deploy/my-app --tail=50
+
+# Follow and filter in real-time
+tail -f /var/log/app.log | grep --line-buffered "ERROR"
+# --line-buffered prevents grep from buffering, ensuring real-time output
+```
+
+**The `-f` vs `-F` distinction:**
+
+| Flag | Behavior |
+|------|----------|
+| `-f` | Follow by file descriptor. If the file is renamed/rotated, keeps reading the old (now renamed) file. |
+| `-F` | Follow by name. If the file is rotated, detects the new file and switches. Equivalent to `-f --retry`. |
+
+Always use `-F` when tailing logs that may be rotated by logrotate or by container runtimes.
+
+---
+
+#### `wc` — Word, Line, and Byte Counts
+
+**Syntax:** `wc [OPTIONS] [FILE...]`
+
+```bash
+# Count lines, words, bytes (in that order)
+wc /etc/passwd
+#   45   87  2456 /etc/passwd
+#   ^lines ^words ^bytes
+
+# Count lines only (-l is the most commonly used flag)
+wc -l /var/log/syslog
+
+# Count running containers
+docker ps -q | wc -l
+
+# Count pods in CrashLoopBackOff
+kubectl get pods --all-namespaces | grep CrashLoopBackOff | wc -l
+
+# Count unique IP addresses in access log
+awk '{print $1}' /var/log/nginx/access.log | sort -u | wc -l
+
+# Count characters (multibyte-aware)
+echo "hello" | wc -m    # 6 (includes newline)
+
+# Count bytes
+echo "hello" | wc -c    # 6
+
+# Count words
+echo "the quick brown fox" | wc -w    # 4
+
+# Count lines in all YAML files in a directory
+wc -l manifests/*.yaml
+```
+
+---
+
+#### `file` — Determine File Type
+
+Examines file contents (not the extension) to determine the type using magic numbers and heuristics.
+
+**Syntax:** `file [OPTIONS] [FILE...]`
+
+```bash
+# Identify file type
+file /bin/ls
+# /bin/ls: ELF 64-bit LSB pie executable, x86-64, ...
+
+file /etc/hostname
+# /etc/hostname: ASCII text
+
+# Check if a script has correct encoding
+file deploy.sh
+# deploy.sh: Bourne-Again shell script, ASCII text executable
+
+# Detect MIME type (useful for HTTP content-type decisions)
+file --mime-type image.png
+# image.png: image/png
+
+file --mime-type data.json
+# data.json: application/json
+
+# Check if a "text" file is actually binary (corrupt download, etc.)
+file downloaded-artifact
+# downloaded-artifact: gzip compressed data, ...
+
+# Check encoding (detect UTF-8 BOM, Latin-1, etc.)
+file --mime-encoding config.yaml
+# config.yaml: utf-8
+
+# Read from stdin
+curl -s https://example.com/artifact | file -
+# /dev/stdin: gzip compressed data, ...
+
+# Check all files in a directory
+file /etc/kubernetes/pki/*
+```
+
+---
+
+#### `stat` — Detailed File Metadata
+
+Displays comprehensive file metadata: permissions, ownership, timestamps, inode number, block allocation.
+
+**Syntax:** `stat [OPTIONS] [FILE...]`
+
+```bash
+# Full stat output
+stat /etc/passwd
+#   File: /etc/passwd
+#   Size: 2456       Blocks: 8          IO Block: 4096   regular file
+# Device: 259,1      Inode: 524316      Links: 1
+# Access: (0644/-rw-r--r--)  Uid: (    0/    root)   Gid: (    0/    root)
+# Access: 2024-01-15 10:23:45.000000000 +0000
+# Modify: 2024-01-10 08:15:30.000000000 +0000
+# Change: 2024-01-10 08:15:30.000000000 +0000
+#  Birth: 2023-06-01 00:00:00.000000000 +0000
+
+# Custom format — just the permissions in octal
+stat -c '%a' /etc/shadow
+# 640
+
+# Custom format — owner and group
+stat -c '%U:%G' /var/run/docker.sock
+# root:docker
+
+# Custom format — modification time (useful in scripts)
+stat -c '%Y' /var/log/syslog    # epoch seconds
+
+# Check if a certificate file has correct permissions
+stat -c '%a %n' /etc/kubernetes/pki/*.key
+# 600 /etc/kubernetes/pki/apiserver.key   <- correct
+# 644 /etc/kubernetes/pki/ca.key          <- TOO OPEN, security risk
+
+# Filesystem info (not file info)
+stat -f /var
+#   File: "/var"
+#     ID: ... Namelen: 255     Type: ext2/ext3
+# Block size: 4096    ...
+
+# Useful format specifiers:
+# %a  octal permissions    %A  human-readable permissions
+# %U  owner name           %G  group name
+# %s  size in bytes        %Y  modification time (epoch)
+# %n  filename             %i  inode number
+```
+
+---
+
+### Filtering and Searching
+
+---
+
+#### `grep` — Pattern Matching in Text
+
+The single most important text processing tool. Searches for patterns in files or stdin and prints matching lines.
+
+**Syntax:** `grep [OPTIONS] PATTERN [FILE...]`
+
+**Basic usage:**
+
+```bash
+# Search for a string in a file
+grep "error" /var/log/syslog
+
+# Case-insensitive search
+grep -i "warning" /var/log/app.log
+
+# Search recursively in a directory
+grep -r "TODO" /opt/app/src/
+
+# Recursive with file-type filter
+grep -r --include="*.yaml" "image:" /opt/manifests/
+
+# Show line numbers
+grep -n "FATAL" /var/log/app.log
+
+# Show N lines of context around matches
+grep -C 3 "OOMKilled" /var/log/syslog     # 3 lines before AND after
+grep -B 5 "segfault" /var/log/kern.log     # 5 lines before
+grep -A 2 "error" /var/log/app.log         # 2 lines after
+
+# Count matches (don't print them)
+grep -c "404" /var/log/nginx/access.log
+
+# Print only filenames containing matches
+grep -rl "password" /etc/
+
+# Print only filenames NOT containing matches
+grep -rL "healthcheck" /opt/docker/
+
+# Invert match (lines NOT containing pattern)
+grep -v "DEBUG" /var/log/app.log
+
+# Match whole words only (prevents "error" matching "terrorize")
+grep -w "error" /var/log/app.log
+
+# Match exact fixed string (no regex interpretation, faster)
+grep -F "192.168.1.100" /var/log/auth.log
+
+# Multiple patterns (OR logic)
+grep -e "error" -e "fatal" -e "panic" /var/log/syslog
+# Or equivalently with extended regex:
+grep -E "error|fatal|panic" /var/log/syslog
+
+# Read patterns from a file
+grep -f blocked_ips.txt /var/log/nginx/access.log
+```
+
+**Extended Regular Expressions (`grep -E` or `egrep`):**
+
+```bash
+# Match IP addresses (approximate)
+grep -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' /var/log/auth.log
+
+# Match HTTP status codes 4xx and 5xx
+grep -E '"[[:space:]]+(4|5)[0-9]{2}[[:space:]]' /var/log/nginx/access.log
+
+# Match lines starting with a timestamp
+grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}' app.log
+
+# Match pod names with a specific pattern
+kubectl get pods | grep -E 'frontend-[a-z0-9]+-[a-z0-9]+'
+
+# Match either "error" or "Error" or "ERROR"
+grep -iE 'error' /var/log/app.log
+
+# Negative lookahead is NOT supported in grep. Use -v for exclusion:
+grep "error" app.log | grep -v "expected error"
+
+# Match blank lines
+grep -E '^$' config.yaml
+
+# Match non-blank lines
+grep -E '.' config.yaml
+# Or: grep -v '^$' config.yaml
+```
+
+**Perl-Compatible Regular Expressions (`grep -P`):**
+
+```bash
+# Lookahead: lines with "error" NOT followed by "expected"
+grep -P 'error(?!.*expected)' app.log
+
+# Lookbehind: numbers preceded by "count:"
+grep -P '(?<=count:)\d+' metrics.log
+
+# Non-greedy matching
+grep -P '"name":".*?"' response.json
+
+# Match JSON key-value (simple cases — use jq for real JSON parsing)
+grep -P '"status"\s*:\s*"failed"' api-response.json
+```
+
+**Performance and gotchas:**
+
+```bash
+# For huge files, use fixed-string mode when possible (much faster)
+grep -F "exact string" huge.log           # no regex engine overhead
+
+# Use --line-buffered when piping for real-time output
+tail -f app.log | grep --line-buffered "ERROR"
+
+# grep returns exit code 1 when no matches found — this breaks set -e
+# Use || true to suppress in scripts
+count=$(grep -c "error" app.log || true)
+
+# Binary file warning — force text mode
+grep -a "pattern" /var/log/journal/system.journal
+```
+
+**Common flags summary:**
+
+| Flag | Purpose |
+|------|---------|
+| `-i` | Case insensitive |
+| `-v` | Invert match (non-matching lines) |
+| `-c` | Count matches |
+| `-n` | Show line numbers |
+| `-r` / `-R` | Recursive search |
+| `-l` | Filenames with matches only |
+| `-L` | Filenames without matches |
+| `-w` | Whole word match |
+| `-F` | Fixed string (no regex) |
+| `-E` | Extended regex |
+| `-P` | Perl-compatible regex |
+| `-o` | Print only matching part (not whole line) |
+| `-A N` | N lines after match |
+| `-B N` | N lines before match |
+| `-C N` | N lines before and after |
+| `--include` | Filter files by glob in recursive mode |
+| `--exclude` | Exclude files by glob |
+| `--exclude-dir` | Exclude directories |
+| `--color` | Highlight matches |
+| `--line-buffered` | Flush after each line (for pipes) |
+
+---
+
+#### `pgrep` — Search for Processes by Name
+
+`pgrep` searches the process table, not files. Returns PIDs of matching processes.
+
+**Syntax:** `pgrep [OPTIONS] PATTERN`
+
+```bash
+# Find PIDs of all nginx processes
+pgrep nginx
+
+# Find with full command line match (not just process name)
+pgrep -f "kubectl proxy"
+
+# Show process names alongside PIDs
+pgrep -la nginx
+# 1234 nginx: master process /usr/sbin/nginx
+# 1235 nginx: worker process
+
+# Find processes owned by a specific user
+pgrep -u www-data
+
+# Count matching processes
+pgrep -c java
+
+# Match exact process name (not substring)
+pgrep -x nginx
+
+# Combine with other tools
+pgrep -f "kube-apiserver" | xargs -I{} ls -la /proc/{}/fd | wc -l
+# Count open file descriptors for kube-apiserver
+
+# Check if a process is running (useful in scripts)
+if pgrep -x "dockerd" > /dev/null; then
+  echo "Docker is running"
+else
+  echo "Docker is NOT running"
+fi
+```
+
+---
+
+#### `find` — Search for Files in a Directory Tree
+
+`find` walks a directory tree and evaluates expressions against each file. Unlike `grep` (which searches file contents), `find` searches file metadata: name, size, type, permissions, timestamps.
+
+**Syntax:** `find [PATH...] [EXPRESSION]`
+
+```bash
+# Find all YAML files under /etc/kubernetes
+find /etc/kubernetes -name "*.yaml"
+
+# Find case-insensitive
+find /opt -iname "dockerfile"
+
+# Find by type (f=file, d=directory, l=symlink)
+find /var/log -type f -name "*.log"
+
+# Find files modified in the last 30 minutes
+find /var/log -type f -mmin -30
+
+# Find files modified in the last 7 days
+find /opt/app -type f -mtime -7
+
+# Find files larger than 100MB (useful for disk cleanup in containers)
+find / -type f -size +100M 2>/dev/null
+
+# Find files with specific permissions
+find /etc -type f -perm 0777        # exact match
+find /etc -type f -perm -0002       # world-writable files (security audit)
+find / -type f -perm -4000          # SUID binaries (security audit)
+
+# Find empty files or directories
+find /tmp -type f -empty
+find /opt -type d -empty
+
+# Find and execute a command on each result
+find /var/log -name "*.log.gz" -mtime +90 -exec rm {} \;
+
+# Find and execute with confirmation
+find /tmp -type f -mtime +30 -ok rm {} \;
+
+# More efficient: use + to batch arguments (like xargs)
+find /var/log -name "*.log" -exec grep -l "error" {} +
+
+# Find with multiple conditions (AND is implicit)
+find /etc -type f -name "*.conf" -newer /etc/hostname
+
+# OR conditions
+find /var/log -name "*.log" -o -name "*.txt"
+
+# NOT condition
+find /opt -type f ! -name "*.pyc"
+
+# Find broken symlinks
+find /usr/local -xtype l
+
+# Limit search depth
+find /etc -maxdepth 2 -name "*.conf"
+
+# Find files owned by a specific user
+find /home -user deploy -type f
+
+# Print with custom format
+find /var/log -type f -printf '%s %p\n' | sort -rn | head -20
+# Lists the 20 largest files with sizes, sorted
+
+# Find and delete (CAREFUL — test with -print first)
+find /tmp -type f -name "*.tmp" -mtime +7 -print     # preview
+find /tmp -type f -name "*.tmp" -mtime +7 -delete     # execute
+```
+
+**Cloud/platform use cases:**
+
+```bash
+# Find large files in a container (disk pressure debugging)
+find / -xdev -type f -size +50M -exec ls -lh {} \; 2>/dev/null | sort -k5 -rh
+
+# Find recently modified config files (post-incident forensics)
+find /etc -type f -mmin -60 -ls
+
+# Find all Kubernetes manifests
+find /opt/k8s -name "*.yaml" -o -name "*.yml" | xargs grep "kind:" | sort
+
+# Audit world-readable files in sensitive directories
+find /etc/kubernetes/pki -type f -perm -004
+
+# Find log files consuming the most space
+find /var/log -type f -name "*.log" -printf '%s %p\n' | sort -rn | head -10
+```
+
+**Performance considerations:**
+
+- `find` walks the entire directory tree. Use `-maxdepth` to limit scope.
+- `-exec {} \;` forks a new process per file. Use `-exec {} +` or pipe to `xargs` for batching.
+- On huge filesystems, consider `locate` (uses a pre-built database) for name searches.
+- `-xdev` prevents crossing filesystem boundaries (avoids walking NFS mounts, proc, etc.).
+
+---
+
+### Transformation
+
+---
+
+#### `sed` — Stream Editor
+
+`sed` applies editing commands to each line of input. It processes text line by line using a simple command language. The most common operation is substitution.
+
+**Syntax:** `sed [OPTIONS] 'COMMAND' [FILE...]`
+
+**Substitution (`s` command):**
+
+```bash
+# Basic substitution: replace first occurrence on each line
+sed 's/error/ERROR/' app.log
+
+# Replace ALL occurrences on each line (global flag)
+sed 's/http/https/g' urls.txt
+
+# Case-insensitive substitution (GNU sed)
+sed 's/error/ERROR/gI' app.log
+
+# Replace with a different delimiter (useful when pattern contains /)
+sed 's|/var/log|/mnt/logs|g' config.conf
+sed 's#http://#https://#g' urls.txt
+
+# Replace in-place (modifies the file)
+sed -i 's/old-registry.io/new-registry.io/g' deployment.yaml
+
+# In-place with backup
+sed -i.bak 's/old-registry.io/new-registry.io/g' deployment.yaml
+# Creates deployment.yaml.bak with original content
+
+# macOS sed requires an argument after -i (use '' for no backup)
+sed -i '' 's/old/new/g' file.txt
+```
+
+**Line addressing:**
+
+```bash
+# Apply substitution only to line 5
+sed '5s/foo/bar/' file.txt
+
+# Apply to lines 10 through 20
+sed '10,20s/foo/bar/' file.txt
+
+# Apply to lines matching a pattern
+sed '/^#/s/old/new/g' config.conf    # only on comment lines
+
+# Apply to lines between two patterns
+sed '/BEGIN/,/END/s/debug/info/g' config.yaml
+```
+
+**Deletion (`d` command):**
+
+```bash
+# Delete lines matching a pattern
+sed '/^#/d' config.conf             # remove comments
+sed '/^$/d' config.conf             # remove blank lines
+sed '/^#/d; /^$/d' config.conf      # remove both
+
+# Delete a specific line
+sed '1d' file.txt                   # remove first line (header)
+
+# Delete a range of lines
+sed '1,5d' file.txt                 # remove first 5 lines
+
+# Delete from pattern to end of file
+sed '/^---$/,$d' output.txt
+```
+
+**Insertion and appending:**
+
+```bash
+# Insert a line BEFORE a match
+sed '/^server {/i\    # Added by automation' nginx.conf
+
+# Append a line AFTER a match
+sed '/^server {/a\    include /etc/nginx/security.conf;' nginx.conf
+
+# Replace an entire line
+sed '/^HOSTNAME=/c\HOSTNAME=new-hostname' /etc/sysconfig/network
+```
+
+**Multi-command and advanced patterns:**
+
+```bash
+# Multiple commands with -e
+sed -e 's/foo/bar/g' -e 's/baz/qux/g' file.txt
+
+# Print only matching lines (like grep, but with transformation)
+sed -n '/error/p' app.log
+
+# Print a range of lines
+sed -n '10,20p' file.txt           # print lines 10-20
+
+# Capture groups and back-references
+sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+).*"(GET|POST) ([^"]*)".*" ([0-9]+)/\1 \2 \3 \4/' access.log
+# Extracts: IP METHOD PATH STATUS from nginx access log
+
+# Transform image tags in Kubernetes manifests
+sed -E 's|(image: )myregistry.io/(.+):.*|\1myregistry.io/\2:v2.0.0|' deployment.yaml
+
+# Remove ANSI color codes from CI/CD output
+sed 's/\x1b\[[0-9;]*m//g' ci-output.log
+
+# Add a prefix to every line
+sed 's/^/[APP] /' app.log
+
+# Remove trailing whitespace
+sed 's/[[:space:]]*$//' file.txt
+
+# Convert Windows line endings to Unix
+sed -i 's/\r$//' script.sh
+```
+
+**Gotchas:**
+
+- `sed` uses Basic Regular Expressions (BRE) by default. Use `-E` (or `-r` on older GNU sed) for Extended Regular Expressions.
+- In BRE: `+`, `?`, `{`, `}`, `(`, `)` are literal unless escaped.
+- In ERE (with `-E`): these are metacharacters and must be escaped to be literal.
+- `-i` without a backup suffix is irreversible. Always test without `-i` first.
+- macOS sed and GNU sed differ in `-i` syntax and some flags.
+
+---
+
+#### `awk` — Pattern-Action Text Processing
+
+`awk` is a full programming language for text processing. It reads input line by line, splits each line into fields, and executes actions on matching patterns. It's the tool to reach for when you need column-based processing.
+
+**Syntax:** `awk 'PATTERN { ACTION }' [FILE...]`
+
+**Field splitting basics:**
+
+By default, awk splits each line on whitespace. Fields are `$1`, `$2`, etc. `$0` is the entire line. `NF` is the number of fields. `NR` is the line number.
+
+```bash
+# Print the first field of each line
+awk '{print $1}' /var/log/nginx/access.log
+
+# Print specific columns from ps output
+ps aux | awk '{print $1, $2, $11}'    # user, pid, command
+
+# Print the last field
+awk '{print $NF}' file.txt
+
+# Print second-to-last field
+awk '{print $(NF-1)}' file.txt
+
+# Custom field separator
+awk -F: '{print $1, $3}' /etc/passwd    # username, UID
+
+# Multiple character separator
+awk -F'::' '{print $1}' file.txt
+
+# CSV parsing (naive — doesn't handle quoted fields)
+awk -F, '{print $2}' data.csv
+
+# Tab-separated
+awk -F'\t' '{print $1}' data.tsv
+```
+
+**Pattern matching:**
+
+```bash
+# Print lines matching a regex
+awk '/error/' app.log
+
+# Print lines NOT matching
+awk '!/DEBUG/' app.log
+
+# Print lines where a specific field matches
+awk '$9 >= 500' /var/log/nginx/access.log    # HTTP 5xx errors
+
+# Print lines where field equals a value
+awk -F: '$3 == 0' /etc/passwd    # UID 0 (root accounts)
+
+# Combine patterns
+awk '$9 >= 400 && $9 < 500' access.log    # 4xx errors only
+
+# Range patterns (from first match to second match)
+awk '/START/,/END/' logfile.txt
+```
+
+**Built-in variables:**
+
+| Variable | Meaning |
+|----------|---------|
+| `$0` | Entire current line |
+| `$1`..`$N` | Field N |
+| `NR` | Current line number (across all files) |
+| `NF` | Number of fields in current line |
+| `FS` | Field separator (input) |
+| `OFS` | Output field separator |
+| `RS` | Record separator (default: newline) |
+| `ORS` | Output record separator |
+| `FNR` | Line number in current file |
+| `FILENAME` | Current filename |
+
+```bash
+# Set output field separator
+awk -F: 'BEGIN{OFS=","} {print $1, $3, $7}' /etc/passwd
+# root,0,/bin/bash
+
+# Skip the header line
+awk 'NR > 1 {print $1}' data.csv
+
+# Print line numbers
+awk '{print NR, $0}' file.txt
+```
+
+**Aggregation and computation:**
+
+```bash
+# Sum a column
+awk '{sum += $5} END {print sum}' data.txt
+
+# Average
+awk '{sum += $1; count++} END {print sum/count}' numbers.txt
+
+# Count occurrences of each unique value in a column
+awk '{count[$1]++} END {for (k in count) print count[k], k}' access.log | sort -rn
+
+# Sum request bytes by IP address
+awk '{bytes[$1] += $10} END {for (ip in bytes) print bytes[ip], ip}' access.log | sort -rn | head -10
+
+# Find maximum value
+awk 'BEGIN{max=0} $5 > max {max=$5; line=$0} END {print max, line}' data.txt
+
+# Calculate request rate per second
+awk '{count[$4]++} END {for (ts in count) print ts, count[ts]}' access.log
+```
+
+**Practical cloud/platform examples:**
+
+```bash
+# Top 10 IPs by request count from nginx access log
+awk '{print $1}' /var/log/nginx/access.log | sort | uniq -c | sort -rn | head -10
+
+# Show pods using more than 1Gi memory (from kubectl top)
+kubectl top pods --no-headers | awk '$3 ~ /[0-9]+Mi/ {gsub(/Mi/,"",$3); if ($3 > 1024) print $1, $3"Mi"}'
+
+# Parse /proc/meminfo
+awk '/^(MemTotal|MemFree|MemAvailable|Buffers|Cached):/ {printf "%-15s %10.2f GB\n", $1, $2/1024/1024}' /proc/meminfo
+
+# Filter docker stats output
+docker stats --no-stream | awk 'NR>1 && $3+0 > 50 {print $1, $2, $3}'
+# Containers using >50% CPU
+
+# Extract error rates from structured logs
+awk -F'"' '/status":/ {for(i=1;i<=NF;i++) if($i ~ /status/) print $(i+2)}' app.json.log | sort | uniq -c
+
+# Multi-line awk program for log analysis
+awk '
+  /^[0-9]{4}-[0-9]{2}-[0-9]{2}/ { timestamp = $1 " " $2 }
+  /ERROR/ { errors[timestamp]++ }
+  END {
+    for (ts in errors)
+      printf "%s  %d errors\n", ts, errors[ts]
+  }
+' app.log | sort
+```
+
+**Printf for formatted output:**
+
+```bash
+# Formatted table output
+awk -F: '{printf "%-20s UID=%-6d Shell=%s\n", $1, $3, $7}' /etc/passwd
+
+# Generate a Markdown table from CSV
+awk -F, '
+  NR==1 { printf "| "; for(i=1;i<=NF;i++) printf "%s | ", $i; print "";
+           printf "|"; for(i=1;i<=NF;i++) printf "---|"; print "" }
+  NR>1  { printf "| "; for(i=1;i<=NF;i++) printf "%s | ", $i; print "" }
+' data.csv
+```
+
+---
+
+#### `cut` — Extract Columns from Lines
+
+Extracts sections from each line of input by byte position, character position, or delimiter-separated field.
+
+**Syntax:** `cut [OPTIONS] [FILE...]`
+
+```bash
+# Cut by field with delimiter
+cut -d: -f1 /etc/passwd                # usernames
+cut -d: -f1,3 /etc/passwd              # username and UID
+cut -d: -f1,3-5 /etc/passwd            # username and fields 3 through 5
+
+# Cut by character position
+cut -c1-10 /var/log/syslog             # first 10 characters (date portion)
+
+# Cut with tab delimiter (default)
+cut -f2 data.tsv
+
+# Cut with comma delimiter
+cut -d, -f2,4 data.csv
+
+# Extract all fields EXCEPT specific ones
+cut -d: -f1,3 --complement /etc/passwd  # everything except field 1 and 3
+
+# Practical: extract container IDs from docker ps
+docker ps --format '{{.ID}} {{.Names}} {{.Status}}' | cut -d' ' -f1
+
+# Extract the namespace from kubectl output
+kubectl get pods --all-namespaces --no-headers | awk '{print $1}' | sort -u
+# (awk is often better than cut for whitespace-delimited data because
+#  cut treats each space as a separate delimiter)
+```
+
+**Gotcha:** `cut` doesn't collapse multiple delimiters. For whitespace-delimited data where fields are separated by variable amounts of space (like `ps`, `ls -l`, `df`), use `awk` instead.
+
+```bash
+# This FAILS with cut because ps output has variable spacing
+ps aux | cut -d' ' -f1       # wrong — gets empty fields
+
+# This WORKS because awk treats consecutive whitespace as one separator
+ps aux | awk '{print $1}'    # correct
+```
+
+---
+
+#### `tr` — Translate or Delete Characters
+
+Character-level transformation. Works on single characters, not strings. Reads from stdin only (doesn't accept file arguments).
+
+**Syntax:** `tr [OPTIONS] SET1 [SET2]`
+
+```bash
+# Convert lowercase to uppercase
+echo "hello world" | tr 'a-z' 'A-Z'
+# HELLO WORLD
+
+# Convert uppercase to lowercase
+echo "ERROR" | tr 'A-Z' 'a-z'
+
+# Delete specific characters
+echo "Hello, World! 123" | tr -d '0-9'
+# Hello, World!
+
+# Delete newlines (merge lines into one)
+cat hosts.txt | tr -d '\n'
+
+# Replace newlines with spaces
+kubectl get pods -o name | tr '\n' ' '
+
+# Squeeze repeated characters
+echo "too    many    spaces" | tr -s ' '
+# too many spaces
+
+# Replace characters (translate colons to tabs)
+cut -d: -f1,3,7 /etc/passwd | tr ':' '\t'
+
+# Remove carriage returns (Windows -> Unix line endings)
+tr -d '\r' < windows-file.txt > unix-file.txt
+
+# Replace non-alphanumeric characters with newlines (tokenize)
+tr -cs 'a-zA-Z0-9' '\n' < document.txt
+
+# Generate a random password
+tr -dc 'a-zA-Z0-9!@#$%' < /dev/urandom | head -c 32; echo
+
+# ROT13 encoding (trivial obfuscation)
+echo "secret message" | tr 'a-zA-Z' 'n-za-mN-ZA-M'
+
+# Remove all whitespace
+echo "  hello   world  " | tr -d '[:space:]'
+```
+
+**Character classes:**
+
+| Class | Matches |
+|-------|---------|
+| `[:alpha:]` | Letters |
+| `[:digit:]` | Digits |
+| `[:alnum:]` | Letters and digits |
+| `[:space:]` | Whitespace (space, tab, newline) |
+| `[:upper:]` | Uppercase letters |
+| `[:lower:]` | Lowercase letters |
+| `[:punct:]` | Punctuation |
+
+---
+
+#### `paste` — Merge Lines from Multiple Files
+
+Merges corresponding lines from multiple files side by side, or joins all lines from stdin into one line.
+
+**Syntax:** `paste [OPTIONS] [FILE...]`
+
+```bash
+# Merge two files side by side (tab-separated by default)
+paste names.txt ages.txt
+# Alice   30
+# Bob     25
+
+# Custom delimiter
+paste -d',' names.txt ages.txt
+# Alice,30
+# Bob,25
+
+# Join all lines from stdin into a single line (serial mode)
+kubectl get pods -o name | paste -sd','
+# pod/nginx,pod/redis,pod/postgres
+
+# Join stdin lines with a custom delimiter
+seq 5 | paste -sd'+'
+# 1+2+3+4+5
+
+# Then evaluate:
+seq 5 | paste -sd'+' | bc
+# 15
+
+# Create two-column output from a single stream
+seq 10 | paste - -
+# 1   2
+# 3   4
+# 5   6
+# 7   8
+# 9   10
+
+# Three columns
+seq 12 | paste - - -
+# 1   2   3
+# 4   5   6
+# ...
+
+# Combine with cut for column rearrangement
+paste <(cut -d: -f1 /etc/passwd) <(cut -d: -f7 /etc/passwd)
+```
+
+---
+
+#### `sort` — Sort Lines
+
+Sorts lines of text. Understands numeric, lexicographic, and custom key-based sorting.
+
+**Syntax:** `sort [OPTIONS] [FILE...]`
+
+```bash
+# Alphabetical sort (default)
+sort names.txt
+
+# Reverse sort
+sort -r names.txt
+
+# Numeric sort
+sort -n numbers.txt
+
+# Numeric sort, descending
+sort -rn numbers.txt
+
+# Sort by human-readable sizes (K, M, G)
+du -sh /var/log/* | sort -rh
+
+# Sort by specific field (key)
+sort -t: -k3 -n /etc/passwd         # sort by UID (3rd colon-delimited field)
+
+# Sort by multiple keys
+sort -t',' -k2,2 -k1,1 data.csv     # sort by column 2, then column 1
+
+# Sort and remove duplicates
+sort -u names.txt
+
+# Stable sort (preserve original order of equal elements)
+sort -s -k2,2 data.txt
+
+# Check if a file is already sorted
+sort -c data.txt && echo "sorted" || echo "not sorted"
+
+# Sort IP addresses correctly
+sort -t. -k1,1n -k2,2n -k3,3n -k4,4n ips.txt
+
+# Sort Kubernetes pods by restart count
+kubectl get pods --no-headers | sort -k4 -rn
+
+# Sort du output to find largest directories
+du -sh /* 2>/dev/null | sort -rh | head -10
+
+# Version sort (handles version numbers like 1.2.10 > 1.2.9)
+sort -V versions.txt
+
+# Month sort
+sort -M dates.txt    # Jan, Feb, Mar, ...
+
+# Random sort (shuffle)
+sort -R names.txt    # random permutation
+```
+
+---
+
+#### `uniq` — Deduplicate Adjacent Lines
+
+Filters or counts **adjacent** duplicate lines. Input MUST be sorted first (or duplicates must be adjacent) for uniq to work correctly.
+
+**Syntax:** `uniq [OPTIONS] [INPUT [OUTPUT]]`
+
+```bash
+# Remove adjacent duplicates (input must be sorted)
+sort data.txt | uniq
+
+# Count occurrences
+sort data.txt | uniq -c
+
+# Show ONLY duplicated lines (appear more than once)
+sort data.txt | uniq -d
+
+# Show ONLY unique lines (appear exactly once)
+sort data.txt | uniq -u
+
+# Ignore case when comparing
+sort data.txt | uniq -i
+
+# Skip first N fields (space-delimited) before comparing
+sort data.txt | uniq -f 1    # ignore field 1 when checking duplicates
+
+# Common pattern: count and rank occurrences
+awk '{print $1}' access.log | sort | uniq -c | sort -rn | head -20
+# Top 20 IPs by request count
+
+# Count HTTP status codes
+awk '{print $9}' access.log | sort | uniq -c | sort -rn
+#   15234 200
+#    2341 304
+#     456 404
+#      23 500
+
+# Count unique error messages
+grep "ERROR" app.log | sed 's/.*ERROR //' | sort | uniq -c | sort -rn | head -10
+```
+
+**Gotcha:** `uniq` only removes **adjacent** duplicates. Always `sort` first, or use `sort -u` which combines both operations.
+
+```bash
+# WRONG — misses non-adjacent duplicates
+echo -e "a\nb\na" | uniq       # outputs: a, b, a (NOT deduplicated!)
+
+# CORRECT
+echo -e "a\nb\na" | sort | uniq # outputs: a, b
+```
+
+---
+
+#### `column` — Format Output into Columns
+
+Formats input into aligned columns. Useful for making output readable.
+
+**Syntax:** `column [OPTIONS] [FILE...]`
+
+```bash
+# Auto-format into a table (using whitespace as delimiter)
+mount | column -t
+
+# Format with a specific delimiter
+cat /etc/passwd | column -t -s:
+
+# Format a CSV as a table
+column -t -s',' data.csv
+
+# Format kubectl output into aligned columns
+kubectl get pods -o custom-columns=NAME:.metadata.name,STATUS:.status.phase | column -t
+
+# Format pipeline output
+grep -c "error" /var/log/*.log | column -t -s:
+# /var/log/app.log       42
+# /var/log/nginx.log      3
+# /var/log/syslog         17
+
+# JSON output formatted as a table
+jq -r '.items[] | "\(.name) \(.status) \(.cpu)"' data.json | column -t
+```
+
+---
+
+#### `expand` / `unexpand` — Convert Tabs and Spaces
+
+```bash
+# Convert tabs to spaces (default: 8 spaces per tab stop)
+expand Makefile > Makefile.spaces
+
+# Convert with custom tab width
+expand -t 4 code.py
+
+# Convert spaces to tabs
+unexpand --first-only file.txt       # only leading spaces
+unexpand -a file.txt                 # all spaces
+
+# Check for mixed tabs/spaces in a file
+cat -A file.py | grep -P '^\t* ' | head    # tabs followed by spaces
+```
+
+---
+
+### JSON and Structured Data
+
+---
+
+#### `jq` — JSON Processor
+
+`jq` is a command-line JSON processor. It's essential for working with Kubernetes, cloud APIs, Terraform state, and any JSON-based tooling.
+
+**Syntax:** `jq [OPTIONS] 'FILTER' [FILE...]`
+
+**Basic operations:**
+
+```bash
+# Pretty-print JSON
+echo '{"name":"nginx","version":"1.25"}' | jq .
+
+# Extract a field
+echo '{"name":"nginx","version":"1.25"}' | jq '.name'
+# "nginx"
+
+# Extract as raw string (no quotes)
+echo '{"name":"nginx","version":"1.25"}' | jq -r '.name'
+# nginx
+
+# Nested field access
+echo '{"metadata":{"name":"my-pod","namespace":"default"}}' | jq '.metadata.name'
+
+# Access array elements
+echo '[1,2,3,4,5]' | jq '.[0]'       # first element: 1
+echo '[1,2,3,4,5]' | jq '.[-1]'      # last element: 5
+echo '[1,2,3,4,5]' | jq '.[2:4]'     # slice: [3,4]
+```
+
+**Array operations:**
+
+```bash
+# Iterate over array elements
+echo '[{"name":"a"},{"name":"b"}]' | jq '.[].name'
+# "a"
+# "b"
+
+# Length of array
+echo '[1,2,3]' | jq 'length'
+# 3
+
+# Map: transform each element
+echo '[1,2,3]' | jq 'map(. * 2)'
+# [2,4,6]
+
+# Select: filter elements
+echo '[{"name":"a","status":"running"},{"name":"b","status":"stopped"}]' | \
+  jq '.[] | select(.status == "running")'
+
+# Sort
+echo '[3,1,2]' | jq 'sort'
+
+# Sort by field
+echo '[{"name":"b","age":2},{"name":"a","age":1}]' | jq 'sort_by(.age)'
+
+# Unique
+echo '[1,1,2,3,3]' | jq 'unique'
+
+# Flatten nested arrays
+echo '[[1,2],[3,[4,5]]]' | jq 'flatten'
+# [1,2,3,4,5]
+
+# Group by
+echo '[{"type":"a","v":1},{"type":"b","v":2},{"type":"a","v":3}]' | \
+  jq 'group_by(.type) | map({type: .[0].type, count: length})'
+```
+
+**Object operations:**
+
+```bash
+# Get keys
+echo '{"a":1,"b":2,"c":3}' | jq 'keys'
+# ["a","b","c"]
+
+# Get values
+echo '{"a":1,"b":2}' | jq 'values'
+# [1,2]
+
+# Check if key exists
+echo '{"a":1}' | jq 'has("a")'
+# true
+
+# Add/update a field
+echo '{"name":"app"}' | jq '. + {"version":"2.0"}'
+# {"name":"app","version":"2.0"}
+
+# Delete a field
+echo '{"name":"app","debug":true}' | jq 'del(.debug)'
+
+# Construct a new object
+echo '{"first":"John","last":"Doe","age":30}' | jq '{fullName: (.first + " " + .last), age}'
+
+# Merge objects
+echo '{"a":1}' | jq '. * {"b":2,"a":99}'
+# {"a":99,"b":2}
+```
+
+**String operations:**
+
+```bash
+# String interpolation
+echo '{"name":"app","version":"2.0"}' | jq -r '"\(.name):\(.version)"'
+# app:2.0
+
+# Split and join
+echo '"a,b,c"' | jq 'split(",")'
+# ["a","b","c"]
+
+echo '["a","b","c"]' | jq 'join("-")'
+# "a-b-c"
+
+# Test with regex
+echo '"error: disk full"' | jq 'test("error")'
+# true
+
+# Capture regex groups
+echo '"2024-01-15T10:30:00Z"' | jq 'capture("(?<date>[0-9-]+)T(?<time>[0-9:]+)")'
+# {"date":"2024-01-15","time":"10:30:00"}
+
+# String length
+echo '"hello"' | jq 'length'
+# 5
+
+# Convert to/from number
+echo '"42"' | jq 'tonumber'
+echo '42' | jq 'tostring'
+```
+
+**Conditionals and control flow:**
+
+```bash
+# if-then-else
+echo '{"status":500}' | jq 'if .status >= 500 then "server_error" elif .status >= 400 then "client_error" else "ok" end'
+
+# Alternative operator (default values)
+echo '{"name":"app"}' | jq '.version // "unknown"'
+# "unknown"
+
+# Try-catch for error handling
+echo '{"data":"not a number"}' | jq 'try (.data | tonumber) catch "parse_error"'
+
+# Reduce
+echo '[1,2,3,4,5]' | jq 'reduce .[] as $x (0; . + $x)'
+# 15
+```
+
+**Kubernetes-specific `jq` patterns:**
+
+```bash
+# List all container images across all pods
+kubectl get pods --all-namespaces -o json | \
+  jq -r '.items[] | .spec.containers[] | .image' | sort -u
+
+# Find pods not in Running state
+kubectl get pods --all-namespaces -o json | \
+  jq -r '.items[] | select(.status.phase != "Running") | "\(.metadata.namespace)/\(.metadata.name) \(.status.phase)"'
+
+# Get resource requests and limits
+kubectl get pods -o json | \
+  jq -r '.items[] | .spec.containers[] |
+    "\(.name) cpu_req=\(.resources.requests.cpu // "none") mem_req=\(.resources.requests.memory // "none") cpu_lim=\(.resources.limits.cpu // "none") mem_lim=\(.resources.limits.memory // "none")"'
+
+# List all services with their cluster IPs and ports
+kubectl get svc --all-namespaces -o json | \
+  jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name) \(.spec.clusterIP) \(.spec.ports[] | "\(.port)/\(.protocol)")"'
+
+# Find pods with restart count > 5
+kubectl get pods --all-namespaces -o json | \
+  jq -r '.items[] |
+    select(.status.containerStatuses[]?.restartCount > 5) |
+    "\(.metadata.namespace)/\(.metadata.name) restarts=\(.status.containerStatuses[].restartCount)"'
+
+# Get node allocatable resources
+kubectl get nodes -o json | \
+  jq -r '.items[] | "\(.metadata.name) cpu=\(.status.allocatable.cpu) mem=\(.status.allocatable.memory)"'
+
+# Extract events sorted by timestamp
+kubectl get events -o json | \
+  jq -r '.items | sort_by(.lastTimestamp) | .[] | "\(.lastTimestamp) \(.type) \(.reason) \(.message)"' | tail -20
+```
+
+**AWS CLI + `jq` patterns:**
+
+```bash
+# List EC2 instances with name, ID, and state
+aws ec2 describe-instances | \
+  jq -r '.Reservations[].Instances[] |
+    "\(.InstanceId) \(.State.Name) \((.Tags // [])[] | select(.Key=="Name") | .Value // "unnamed")"'
+
+# Find unattached EBS volumes
+aws ec2 describe-volumes | \
+  jq -r '.Volumes[] | select(.State == "available") | "\(.VolumeId) \(.Size)GB \(.AvailabilityZone)"'
+
+# List S3 buckets with creation dates
+aws s3api list-buckets | jq -r '.Buckets[] | "\(.Name) \(.CreationDate)"'
+
+# Find security groups with 0.0.0.0/0 ingress
+aws ec2 describe-security-groups | \
+  jq -r '.SecurityGroups[] | select(.IpPermissions[].IpRanges[].CidrIp == "0.0.0.0/0") | "\(.GroupId) \(.GroupName)"'
+```
+
+**`jq` flags:**
+
+| Flag | Purpose |
+|------|---------|
+| `-r` | Raw output (no quotes around strings) |
+| `-e` | Set exit code based on output (null/false = 1) |
+| `-c` | Compact output (one line) |
+| `-s` | Slurp: read entire input as one array |
+| `-S` | Sort keys in output |
+| `-n` | Don't read input (use with `--arg` for construction) |
+| `--arg name value` | Pass a string variable |
+| `--argjson name value` | Pass a JSON variable |
+| `--slurpfile name file` | Load a file as a variable |
+| `--rawfile name file` | Load a file as a raw string variable |
+
+```bash
+# Pass variables into jq
+NAMESPACE="production"
+kubectl get pods -n "$NAMESPACE" -o json | \
+  jq --arg ns "$NAMESPACE" '.items[] | select(.metadata.namespace == $ns) | .metadata.name'
+
+# Build JSON from scratch
+jq -n --arg name "my-app" --arg version "1.0" '{name: $name, version: $version}'
+```
+
+---
+
+#### `yq` — YAML Processor
+
+`yq` is like `jq` but for YAML. Multiple implementations exist; the most common is Mike Farah's Go-based `yq`.
+
+**Syntax:** `yq [OPTIONS] 'EXPRESSION' [FILE...]`
+
+```bash
+# Read a field from a YAML file
+yq '.metadata.name' deployment.yaml
+
+# Read with explicit eval command
+yq eval '.spec.replicas' deployment.yaml
+
+# Set a value
+yq -i '.spec.replicas = 5' deployment.yaml
+
+# Add a label
+yq -i '.metadata.labels.env = "production"' deployment.yaml
+
+# Delete a field
+yq -i 'del(.spec.template.metadata.annotations)' deployment.yaml
+
+# Merge YAML files
+yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' base.yaml overlay.yaml
+
+# Convert YAML to JSON
+yq -o json deployment.yaml
+
+# Convert JSON to YAML
+cat data.json | yq -P
+
+# Extract all container images from a multi-document YAML
+yq eval-all '.spec.template.spec.containers[].image' k8s-manifests.yaml
+
+# Update image tag in a Kubernetes deployment
+yq -i '.spec.template.spec.containers[0].image = "myapp:v2.0"' deployment.yaml
+
+# Iterate over array items
+yq '.items[] | .metadata.name' list.yaml
+
+# Count items
+yq '.items | length' list.yaml
+```
+
+---
+
+#### `base64` — Encode and Decode Base64
+
+Used extensively for Kubernetes secrets, JWT tokens, and API payloads.
+
+**Syntax:** `base64 [OPTIONS]`
+
+```bash
+# Encode a string
+echo -n "my-secret-password" | base64
+# bXktc2VjcmV0LXBhc3N3b3Jk
+
+# Decode a string
+echo "bXktc2VjcmV0LXBhc3N3b3Jk" | base64 -d
+# my-secret-password
+
+# IMPORTANT: echo without -n adds a trailing newline, which gets encoded
+echo "hello" | base64       # aGVsbG8K     <- includes \n
+echo -n "hello" | base64    # aGVsbG8=     <- clean
+
+# Decode Kubernetes secrets
+kubectl get secret my-secret -o jsonpath='{.data.password}' | base64 -d
+
+# Decode all data fields from a secret
+kubectl get secret my-secret -o json | \
+  jq -r '.data | to_entries[] | "\(.key): \(.value | @base64d)"'
+
+# Encode a file
+base64 < tls.crt > tls.crt.b64
+
+# Decode a file
+base64 -d < tls.crt.b64 > tls.crt
+
+# Inline base64 in a YAML manifest
+cat <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-secret
+type: Opaque
+data:
+  username: $(echo -n "admin" | base64)
+  password: $(echo -n "s3cur3p@ss" | base64)
+EOF
+
+# Decode a JWT token payload (second segment)
+echo "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMSJ9.xxx" | \
+  cut -d. -f2 | base64 -d 2>/dev/null | jq .
+
+# macOS uses -D for decode (or use base64 -d with GNU coreutils)
+```
+
+---
+
+#### `xargs` — Build and Execute Commands from stdin
+
+Reads items from stdin and executes a command with those items as arguments. Bridges the gap between commands that produce output and commands that need arguments (not stdin).
+
+**Syntax:** `xargs [OPTIONS] [COMMAND [INITIAL-ARGS]]`
+
+```bash
+# Basic: pass stdin items as arguments
+echo "file1 file2 file3" | xargs rm
+
+# One argument per command execution
+echo -e "pod1\npod2\npod3" | xargs -I{} kubectl delete pod {}
+
+# Parallel execution (4 processes at a time)
+find . -name "*.yaml" | xargs -P4 -I{} kubectl apply -f {}
+
+# Handle filenames with spaces (null-delimited)
+find /var/log -name "*.log" -print0 | xargs -0 ls -la
+
+# Limit arguments per invocation
+echo {1..100} | xargs -n 10 echo
+# Runs echo 10 times, with 10 args each
+
+# Prompt before each execution
+echo -e "pod1\npod2" | xargs -p -I{} kubectl delete pod {}
+
+# Delete Kubernetes pods matching a pattern
+kubectl get pods --no-headers | grep "Evicted" | awk '{print $1}' | xargs kubectl delete pod
+
+# Delete all completed jobs
+kubectl get jobs --no-headers | awk '$2 == "1/1"' | awk '{print $1}' | xargs kubectl delete job
+
+# Pull multiple Docker images
+echo -e "nginx:latest\nredis:7\npostgres:15" | xargs -I{} -P3 docker pull {}
+
+# Run a command on multiple hosts
+echo -e "host1\nhost2\nhost3" | xargs -I{} ssh {} "uptime"
+
+# Test connectivity to multiple endpoints
+cat endpoints.txt | xargs -I{} -P5 curl -s -o /dev/null -w "%{http_code} {}\n" {}
+
+# xargs with find (better than find -exec for most cases)
+find /etc -name "*.conf" -print0 | xargs -0 grep -l "ssl"
+```
+
+**Key flags:**
+
+| Flag | Purpose |
+|------|---------|
+| `-I{}` | Replace `{}` with each input item (runs one command per item) |
+| `-n N` | Maximum N arguments per command |
+| `-P N` | Run N processes in parallel |
+| `-0` | Input items are null-delimited (pair with `find -print0`) |
+| `-p` | Prompt before execution |
+| `-t` | Print each command before execution |
+| `--no-run-if-empty` | Don't run command if input is empty (GNU xargs) |
+
+**Gotcha:** Without `-I`, xargs appends all arguments at the end. With `-I{}`, each line runs a separate command. Choose based on whether the target command accepts multiple arguments.
+
+---
+
+### Comparison and Diffing
+
+---
+
+#### `diff` — Compare Files Line by Line
+
+**Syntax:** `diff [OPTIONS] FILE1 FILE2`
+
+```bash
+# Basic line-by-line comparison
+diff old-config.yaml new-config.yaml
+
+# Unified diff format (most readable, used by git)
+diff -u old-config.yaml new-config.yaml
+
+# Side-by-side comparison
+diff -y old-config.yaml new-config.yaml
+
+# Side-by-side with a width
+diff -y -W 120 old-config.yaml new-config.yaml
+
+# Show only whether files differ (exit code 0=same, 1=different)
+diff -q file1 file2
+
+# Recursive directory comparison
+diff -r dir1/ dir2/
+
+# Ignore whitespace differences
+diff -w old.conf new.conf
+
+# Ignore blank lines
+diff -B old.conf new.conf
+
+# Colorized diff (if supported)
+diff --color=auto -u old.conf new.conf
+
+# Compare command outputs using process substitution
+diff <(kubectl get pods -n staging -o name | sort) <(kubectl get pods -n production -o name | sort)
+
+# Compare running config with desired state
+diff <(kubectl get deploy nginx -o yaml) desired-deployment.yaml
+
+# Compare two nodes' configurations
+diff <(ssh node1 "cat /etc/kubelet.conf") <(ssh node2 "cat /etc/kubelet.conf")
+
+# Generate a patch file
+diff -u original.conf modified.conf > changes.patch
+
+# Apply a patch
+patch original.conf < changes.patch
+```
+
+**Exit codes:** 0 = files identical, 1 = files differ, 2 = error.
+
+---
+
+#### `comm` — Compare Two Sorted Files
+
+Outputs three columns: lines only in file1, lines only in file2, lines in both. Both input files must be sorted.
+
+**Syntax:** `comm [OPTIONS] FILE1 FILE2`
+
+```bash
+# Full three-column output
+comm <(sort file1.txt) <(sort file2.txt)
+# Column 1: only in file1
+# Column 2: only in file2
+# Column 3: in both
+
+# Show lines only in file1 (suppress columns 2 and 3)
+comm -23 <(sort file1.txt) <(sort file2.txt)
+
+# Show lines only in file2
+comm -13 <(sort file1.txt) <(sort file2.txt)
+
+# Show lines in BOTH files
+comm -12 <(sort file1.txt) <(sort file2.txt)
+
+# Find pods that exist in staging but not in production
+comm -23 \
+  <(kubectl get pods -n staging -o name | sort) \
+  <(kubectl get pods -n production -o name | sort)
+
+# Find packages installed on server1 but not server2
+comm -23 \
+  <(ssh server1 "dpkg --get-selections" | awk '{print $1}' | sort) \
+  <(ssh server2 "dpkg --get-selections" | awk '{print $1}' | sort)
+
+# Find common security groups between two lists
+comm -12 <(sort sg-list-vpc1.txt) <(sort sg-list-vpc2.txt)
+```
+
+---
+
+### Pipeline Helpers
+
+---
+
+#### `tee` — Duplicate a Stream
+
+Reads from stdin and writes to both stdout AND one or more files. Named after a T-shaped pipe fitting.
+
+**Syntax:** `tee [OPTIONS] [FILE...]`
+
+```bash
+# Save output to a file AND display it
+kubectl get pods | tee pods.txt
+
+# Append to file instead of overwriting
+kubectl get pods | tee -a pods-history.txt
+
+# Write to multiple files
+command | tee file1.txt file2.txt
+
+# Use tee in the middle of a pipeline (debugging)
+cat access.log | grep "POST" | tee /dev/stderr | awk '{print $7}' | sort | uniq -c
+# grep output goes to stderr (visible on screen) AND to awk via the pipe
+
+# Log a command while also processing it
+curl -s https://api.example.com/data | tee api-response.json | jq '.results | length'
+
+# Use with sudo to write to root-owned files
+echo "10.0.1.50 k8s-master" | sudo tee -a /etc/hosts
+
+# Tee into process substitution (write to multiple pipelines)
+kubectl logs deploy/my-app | tee >(grep ERROR > errors.log) >(grep WARN > warnings.log) > /dev/null
+```
+
+---
+
+#### `watch` — Execute a Command Repeatedly
+
+Runs a command at regular intervals and displays the output full-screen. Essential for monitoring.
+
+**Syntax:** `watch [OPTIONS] COMMAND`
+
+```bash
+# Watch pods every 2 seconds (default interval)
+watch kubectl get pods
+
+# Custom interval (every 5 seconds)
+watch -n 5 "kubectl top pods"
+
+# Highlight differences between updates
+watch -d kubectl get pods
+
+# Watch with a title
+watch -t "kubectl get pods"    # hide the header
+
+# Watch disk usage
+watch -n 10 "df -h"
+
+# Watch container resource usage
+watch -n 3 "docker stats --no-stream"
+
+# Watch for Kubernetes deployment rollout
+watch -n 2 "kubectl rollout status deploy/my-app"
+
+# Watch network connections
+watch -n 5 "ss -tlnp"
+
+# Exit when output changes (useful for waiting)
+watch -g "kubectl get deploy nginx -o jsonpath='{.status.availableReplicas}'"
+
+# Watch pipeline (use quotes around the entire command)
+watch -n 5 "kubectl get pods --no-headers | grep -v Running | wc -l"
+```
+
+**Gotcha:** `watch` passes the command to `sh -c`, so bash-specific features may not work. Wrap complex commands in quotes.
+
+---
+
+## Cloud/Platform Scenarios
+
+### Scenario 1: Analyzing Kubernetes Pod Logs
+
+```bash
+# === Basic log inspection ===
+
+# Stream logs from a deployment (follows all pods)
+kubectl logs -f deploy/api-server --tail=100
+
+# Logs from a specific container in a multi-container pod
+kubectl logs my-pod -c sidecar-proxy --tail=200
+
+# Logs from a previous instance (after a crash)
+kubectl logs my-pod --previous
+
+# === Finding errors in logs ===
+
+# Count errors per hour
+kubectl logs deploy/api-server --since=24h | \
+  grep "ERROR" | \
+  awk '{print substr($1,1,13)}' | \      # extract date+hour (2024-01-15T10)
+  sort | uniq -c | sort -rn
+# Output:
+#   142 2024-01-15T14
+#    89 2024-01-15T13
+#    12 2024-01-15T12
+
+# === Parsing structured JSON logs ===
+
+# Most Kubernetes applications emit JSON logs. Parse them with jq:
+kubectl logs deploy/api-server --tail=1000 | \
+  jq -r 'select(.level == "error") | "\(.timestamp) \(.message) \(.error // "")"'
+
+# Top error messages
+kubectl logs deploy/api-server --since=1h | \
+  jq -r 'select(.level == "error") | .message' | \
+  sort | uniq -c | sort -rn | head -10
+
+# Error rate by endpoint
+kubectl logs deploy/api-server --since=1h | \
+  jq -r 'select(.status >= 500) | .path' | \
+  sort | uniq -c | sort -rn
+
+# P99 latency per endpoint
+kubectl logs deploy/api-server --since=1h | \
+  jq -r 'select(.duration != null) | "\(.path) \(.duration)"' | \
+  awk '{
+    path=$1; val=$2;
+    data[path][++n[path]] = val
+  }
+  END {
+    for (p in n) {
+      asort(data[p]);
+      idx = int(n[p] * 0.99);
+      printf "%-40s p99=%.2fms (n=%d)\n", p, data[p][idx], n[p]
+    }
+  }'
+
+# === Aggregating logs across multiple pods ===
+
+# All pods with a label
+kubectl logs -l app=frontend --all-containers --tail=50
+
+# Merge and sort logs from multiple pods by timestamp
+for pod in $(kubectl get pods -l app=api -o name); do
+  kubectl logs "$pod" --tail=100 2>/dev/null
+done | sort -t'T' -k1,1 | grep -i error
+```
+
+### Scenario 2: Inspecting systemd Logs with journalctl
+
+```bash
+# === Basic journalctl usage ===
+
+# Logs for a specific unit
+journalctl -u kubelet --since "1 hour ago"
+
+# Follow logs in real-time
+journalctl -u docker -f
+
+# Logs since last boot
+journalctl -b
+
+# Logs in JSON format for parsing
+journalctl -u nginx -o json --since "30 min ago" | \
+  jq -r 'select(.PRIORITY == "3") | "\(._REALTIME_TIMESTAMP) \(.MESSAGE)"'
+# PRIORITY: 0=emerg, 1=alert, 2=crit, 3=err, 4=warn, 5=notice, 6=info, 7=debug
+
+# === Analyzing kubelet issues ===
+
+# Find OOM kills
+journalctl -k | grep -i "oom\|killed process" | tail -20
+
+# Count kubelet errors per hour
+journalctl -u kubelet --since "24 hours ago" -p err --no-pager | \
+  awk '/^[A-Z][a-z]{2} [0-9]/ {print $1, $2, substr($3,1,2)":00"}' | \
+  sort | uniq -c | sort -rn
+
+# Extract unique error messages from kubelet
+journalctl -u kubelet --since "1 hour ago" -p err --no-pager -o cat | \
+  sed 's/[0-9]\{1,\}//g' | \       # remove numbers for pattern matching
+  sort -u | head -20
+
+# === Disk space used by journal ===
+journalctl --disk-usage
+
+# Vacuum old logs (keep last 500MB)
+sudo journalctl --vacuum-size=500M
+```
+
+### Scenario 3: Parsing JSON from Cloud APIs
+
+```bash
+# === AWS API responses ===
+
+# List EC2 instances in a table format
+aws ec2 describe-instances | jq -r '
+  .Reservations[].Instances[] |
+  [
+    .InstanceId,
+    .InstanceType,
+    .State.Name,
+    (.Tags // [] | map(select(.Key == "Name")) | .[0].Value // "unnamed"),
+    .PrivateIpAddress
+  ] | @tsv
+' | column -t
+
+# Find instances by tag
+aws ec2 describe-instances | jq -r '
+  .Reservations[].Instances[] |
+  select((.Tags // [])[] | .Key == "Environment" and .Value == "production") |
+  "\(.InstanceId) \(.PrivateIpAddress)"
+'
+
+# === GitHub API ===
+
+# List open PRs with their CI status
+curl -s -H "Authorization: token $GITHUB_TOKEN" \
+  "https://api.github.com/repos/org/repo/pulls?state=open" | \
+  jq -r '.[] | "\(.number) \(.title) \(.user.login) \(.created_at)"' | \
+  column -t
+
+# === Generic REST API pagination ===
+
+# Fetch all pages from a paginated API
+page=1
+while true; do
+  response=$(curl -s "https://api.example.com/items?page=$page&per_page=100")
+  count=$(echo "$response" | jq '.items | length')
+  echo "$response" | jq -r '.items[] | .name'
+  [ "$count" -lt 100 ] && break
+  ((page++))
+done
+```
+
+### Scenario 4: Finding Large Files in Containers
+
+```bash
+# === On the host ===
+
+# Find large files in container overlay filesystems
+find /var/lib/docker/overlay2 -type f -size +100M -exec ls -lh {} \; 2>/dev/null | \
+  sort -k5 -rh | head -20
+
+# Identify which container owns a large file
+LARGE_FILE="/var/lib/docker/overlay2/abc123/diff/var/log/huge.log"
+docker ps -q | while read cid; do
+  mounts=$(docker inspect "$cid" --format '{{.GraphDriver.Data.MergedDir}}')
+  if echo "$LARGE_FILE" | grep -q "${mounts%/merged*}"; then
+    echo "Container: $(docker inspect "$cid" --format '{{.Name}}')"
+  fi
+done
+
+# === Inside a container ===
+
+# Exec into a container and find large files
+kubectl exec -it my-pod -- sh -c 'find / -xdev -type f -size +10M -exec ls -lh {} \; 2>/dev/null | sort -k5 -rh | head -10'
+
+# Check disk usage by directory
+kubectl exec my-pod -- du -sh /* 2>/dev/null | sort -rh | head -10
+
+# === Using ephemeral debug containers ===
+kubectl debug my-pod -it --image=busybox -- sh -c 'du -sh /proc/1/root/var/log/*'
+```
+
+### Scenario 5: Auditing Open Ports and Processes
+
+```bash
+# === List listening ports and their processes ===
+
+# All listening TCP ports with process names
+ss -tlnp | awk 'NR>1 {print $4, $NF}' | column -t
+
+# All listening ports (TCP and UDP)
+ss -tulnp
+
+# Same info from netstat (older systems)
+netstat -tlnp 2>/dev/null
+
+# === Find which process uses a specific port ===
+ss -tlnp | grep ':8080'
+
+# === Audit unexpected listeners ===
+
+# Expected ports vs actual
+EXPECTED="22 80 443 6443 10250"
+ACTUAL=$(ss -tln | awk 'NR>1 {split($4,a,":"); print a[length(a)]}' | sort -un)
+
+comm -13 <(echo "$EXPECTED" | tr ' ' '\n' | sort -n) <(echo "$ACTUAL" | sort -n)
+# Shows ports that are listening but NOT in the expected list
+
+# === Check for processes with many connections ===
+ss -tnp | awk '{print $NF}' | grep -oP 'pid=\K[0-9]+' | sort | uniq -c | sort -rn | head -10
+
+# === Docker/Kubernetes port mappings ===
+docker ps --format '{{.Names}}\t{{.Ports}}' | column -t
+kubectl get svc --all-namespaces -o wide | awk '{print $1, $2, $5, $6}' | column -t
+```
+
+### Scenario 6: Extracting Metrics from Logs
+
+```bash
+# === Request rate over time ===
+
+# Requests per minute from nginx access log
+awk '{print substr($4,2,17)}' /var/log/nginx/access.log | \
+  # Extract [15/Jan/2024:10:30
+  uniq -c | \
+  tail -30
+# Shows request count per minute for the last 30 minutes
+
+# === Response time percentiles ===
+
+# Assuming log format includes request time as the last field
+awk '{print $NF}' /var/log/nginx/access.log | \
+  sort -n | \
+  awk '
+    {vals[NR]=$1; sum+=$1}
+    END {
+      n=NR;
+      printf "count:  %d\n", n;
+      printf "mean:   %.3f\n", sum/n;
+      printf "p50:    %.3f\n", vals[int(n*0.5)];
+      printf "p90:    %.3f\n", vals[int(n*0.9)];
+      printf "p95:    %.3f\n", vals[int(n*0.95)];
+      printf "p99:    %.3f\n", vals[int(n*0.99)];
+      printf "max:    %.3f\n", vals[n];
+    }
+  '
+
+# === Error rate percentage ===
+
+awk '
+  {total++}
+  $9 >= 500 {errors++}
+  END {printf "Total: %d, Errors: %d, Rate: %.2f%%\n", total, errors, (errors/total)*100}
+' /var/log/nginx/access.log
+
+# === Top slow endpoints ===
+
+# Assuming $7 is the path and $NF is the response time
+awk '{
+  path=$7;
+  time=$NF;
+  count[path]++;
+  sum[path]+=time;
+  if(time > max[path]) max[path]=time
+}
+END {
+  for(p in count)
+    printf "%-50s avg=%.3f max=%.3f n=%d\n", p, sum[p]/count[p], max[p], count[p]
+}' /var/log/nginx/access.log | sort -t= -k2 -rn | head -10
+
+# === Bandwidth by IP ===
+
+awk '{ip=$1; bytes=$10} bytes ~ /^[0-9]+$/ {bw[ip]+=bytes}
+  END {for(ip in bw) printf "%15s  %.2f MB\n", ip, bw[ip]/1048576}
+' /var/log/nginx/access.log | sort -k2 -rn | head -10
+```
+
+### Scenario 7: CI/CD Log Filtering
+
+```bash
+# === Filter CI/CD output for actionable information ===
+
+# Strip ANSI color codes from CI output
+sed 's/\x1b\[[0-9;]*m//g' ci-output.log
+
+# Extract test failures from pytest output
+grep -A 5 "FAILED" test-output.log
+
+# Extract failed steps from a CI log
+grep -E "(FAIL|ERROR|FATAL)" ci-output.log | grep -v "expected"
+
+# Count test results
+grep -oP '(passed|failed|skipped|error)' test-output.log | sort | uniq -c
+
+# Extract Docker build time per layer
+grep -E "^Step [0-9]+/" build.log | \
+  awk '{step=$0; getline; if(/---/) getline; print step, $0}'
+
+# Find slow CI steps
+grep -E "^\[.*\] (Step|Stage)" ci-output.log | \
+  awk -F'[][]' '{print $2, $0}' | sort
+
+# Terraform plan summary
+terraform plan -no-color 2>&1 | grep -E "^(Plan:|  #|  ~|  \+|  -)" 
+
+# Ansible recap
+grep -A 100 "PLAY RECAP" ansible-output.log | \
+  awk '/^$/{exit} {print}' | column -t
+```
+
+### Scenario 8: Troubleshooting Memory and File Descriptor Leaks
+
+```bash
+# === Memory investigation ===
+
+# Top memory consumers
+ps aux --sort=-%mem | head -20
+
+# Memory usage for a specific process over time
+PID=$(pgrep -x my-app)
+while true; do
+  awk '/VmRSS/ {printf "%s %s KB\n", strftime("%T"), $2}' /proc/$PID/status
+  sleep 5
+done
+
+# Check for OOM events
+dmesg | grep -i "oom\|killed process\|out of memory"
+journalctl -k | grep -i "oom\|killed process"
+
+# Kubernetes memory pressure
+kubectl describe node | grep -A5 "Conditions:" | grep -i memory
+
+# Pod memory usage vs limits
+paste \
+  <(kubectl top pods --no-headers | awk '{print $1, $3}') \
+  <(kubectl get pods -o json | jq -r '.items[] | "\(.metadata.name) \(.spec.containers[0].resources.limits.memory // "none")"') | \
+  column -t
+
+# === File descriptor investigation ===
+
+# Count open FDs for a process
+ls /proc/$(pgrep my-app)/fd | wc -l
+
+# System-wide FD usage
+cat /proc/sys/fs/file-nr
+# field1: allocated FDs, field2: unused allocated, field3: max
+
+# Top processes by open FD count
+for pid in /proc/[0-9]*/fd; do
+  pid_num=${pid#/proc/}; pid_num=${pid_num%/fd}
+  count=$(ls "$pid" 2>/dev/null | wc -l)
+  name=$(cat /proc/$pid_num/comm 2>/dev/null)
+  echo "$count $pid_num $name"
+done 2>/dev/null | sort -rn | head -20
+
+# Watch FD count over time for a leaky process
+PID=$(pgrep -x my-app)
+watch -n 5 "ls /proc/$PID/fd | wc -l"
+
+# What types of FDs are open? (sockets, pipes, files)
+ls -la /proc/$(pgrep my-app)/fd | awk '{print $NF}' | \
+  sed 's/.*\///' | sort | uniq -c | sort -rn
+
+# Find processes with many CLOSE_WAIT connections (potential leak)
+ss -tnp state close-wait | awk 'NR>1 {print $NF}' | sort | uniq -c | sort -rn
+```
+
+---
+
+## Advanced Topics
+
+### Regular Expressions Deep Dive
+
+Regular expressions are the backbone of text processing. This section covers practical patterns, not academic theory.
+
+**Basic vs Extended vs Perl-Compatible:**
+
+| Feature | BRE (grep, sed) | ERE (grep -E, sed -E) | PCRE (grep -P) |
+|---------|-----------------|----------------------|-----------------|
+| Literal match | `abc` | `abc` | `abc` |
+| Any character | `.` | `.` | `.` |
+| Zero or more | `*` | `*` | `*` |
+| One or more | `\+` | `+` | `+` |
+| Zero or one | `\?` | `?` | `?` |
+| Alternation | `\|` | `\|` | `\|` |
+| Grouping | `\(\)` | `()` | `()` |
+| Repetition | `\{n,m\}` | `{n,m}` | `{n,m}` |
+| Word boundary | `\b` | `\b` | `\b` |
+| Lookahead | N/A | N/A | `(?=...)`, `(?!...)` |
+| Lookbehind | N/A | N/A | `(?<=...)`, `(?<!...)` |
+| Non-greedy | N/A | N/A | `*?`, `+?` |
+
+**Character classes:**
+
+```bash
+[abc]        # a, b, or c
+[a-z]        # lowercase letter
+[A-Z]        # uppercase letter
+[0-9]        # digit
+[^abc]       # NOT a, b, or c
+[a-zA-Z0-9]  # alphanumeric
+
+# POSIX classes (use inside brackets: [[:digit:]])
+[:digit:]    # [0-9]
+[:alpha:]    # [a-zA-Z]
+[:alnum:]    # [a-zA-Z0-9]
+[:space:]    # whitespace
+[:upper:]    # [A-Z]
+[:lower:]    # [a-z]
+[:punct:]    # punctuation
+[:print:]    # printable characters
+```
+
+**Anchors:**
+
+```bash
+^            # start of line
+$            # end of line
+\b           # word boundary
+\B           # non-word boundary
+
+# Examples:
+grep '^root' /etc/passwd       # lines starting with "root"
+grep '\.conf$' files.txt       # lines ending with ".conf"
+grep '\berror\b' app.log       # "error" as a whole word
+```
+
+**Practical regex patterns for cloud/platform work:**
+
+```bash
+# Match an IP address (approximate but useful)
+grep -E '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' access.log
+
+# Match a CIDR block
+grep -E '\b([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}\b' config.txt
+
+# Match a MAC address
+grep -Ei '([0-9a-f]{2}:){5}[0-9a-f]{2}' arp.txt
+
+# Match an email address (simplified)
+grep -E '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' contacts.txt
+
+# Match a UUID
+grep -Ei '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' logs.txt
+
+# Match an ISO 8601 timestamp
+grep -E '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' app.log
+
+# Match a Kubernetes resource name (DNS subdomain: lowercase, digits, hyphens)
+grep -E '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+
+# Match a semantic version
+grep -E 'v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' changelog.txt
+
+# Match a Docker image reference
+grep -E '[a-zA-Z0-9._/-]+:[a-zA-Z0-9._-]+' deployment.yaml
+
+# Match a port number (1-65535, approximate)
+grep -E '\b[0-9]{1,5}\b'
+
+# Match AWS ARN
+grep -E 'arn:aws:[a-z0-9-]+:[a-z0-9-]*:[0-9]*:.+' config.txt
+
+# Match a JSON string value
+grep -oP '"[^"]+"\s*:\s*"[^"]*"' response.json
+```
+
+**Regex performance tips:**
+
+- Avoid catastrophic backtracking: patterns like `(a+)+` on long strings.
+- Use `grep -F` for fixed strings (no regex engine overhead).
+- Anchor patterns when possible (`^pattern` is faster than `.*pattern`).
+- Be specific: `[0-9]{1,3}` is better than `\d+` for known-length fields.
+
+---
+
+### Performance Tips for Large Files
+
+```bash
+# === Avoid loading entire files into memory ===
+
+# BAD: loads entire file into awk, then sorts everything
+awk '{print $1}' huge.log | sort | uniq -c | sort -rn
+
+# BETTER for very large files: use LC_ALL=C for byte-level comparison (10x faster sort)
+LC_ALL=C awk '{print $1}' huge.log | LC_ALL=C sort | uniq -c | sort -rn
+
+# === Use grep -F for fixed strings (no regex engine overhead) ===
+grep -F "exact error message" huge.log        # fast
+grep "exact error message" huge.log           # slower (regex engine)
+
+# === Use grep to reduce data BEFORE expensive tools ===
+# GOOD: grep first, then awk
+grep "ERROR" huge.log | awk '{print $5}'
+# BAD: awk processes every line
+awk '/ERROR/ {print $5}' huge.log    # same result, but slower for simple patterns
+
+# === Parallelize with GNU parallel or xargs -P ===
+# Split a huge file and process in parallel
+split -l 1000000 huge.log /tmp/chunk_
+ls /tmp/chunk_* | xargs -P4 -I{} sh -c 'grep -c "ERROR" {} | paste -sd+ | bc'
+
+# === Use mmap-based tools for huge files ===
+# ripgrep (rg) is significantly faster than grep for large codebases
+rg "pattern" /var/log/
+
+# === tail + head for extracting a range without reading the whole file ===
+# Lines 1000000 to 1000100 (reads from the start, but stops early)
+sed -n '1000000,1000100p' huge.log
+# Alternative:
+tail -n +1000000 huge.log | head -100
+
+# === Count lines without reading content ===
+wc -l < huge.log                   # fast, kernel-optimized
+
+# === Process compressed logs without decompressing to disk ===
+zgrep "ERROR" /var/log/syslog.*.gz
+zcat /var/log/syslog.1.gz | awk '{print $1}' | sort | uniq -c | sort -rn
+```
+
+---
+
+### Handling Huge Logs Safely
+
+```bash
+# === Never use vim/nano on huge files — use less ===
+less +F /var/log/huge.log
+
+# === Check file size before processing ===
+ls -lh /var/log/app.log
+stat -c '%s' /var/log/app.log    # bytes
+
+# === Tail the last N lines for initial investigation ===
+tail -10000 /var/log/app.log | grep "ERROR"
+
+# === Sample from a large file (every Nth line) ===
+awk 'NR % 1000 == 0' huge.log     # every 1000th line
+
+# === Process in chunks to avoid memory exhaustion ===
+split -l 100000 huge.log /tmp/chunk_
+for chunk in /tmp/chunk_*; do
+  grep -c "ERROR" "$chunk"
+done | paste -sd+ | bc
+rm /tmp/chunk_*
+
+# === Use timeout to prevent runaway commands ===
+timeout 30 grep -c "pattern" huge.log
+
+# === Truncate a runaway log (CAREFUL — data loss) ===
+# Truncate to zero (keep file descriptor valid for writing process)
+> /var/log/runaway.log
+# Or truncate to last 1000 lines:
+tail -1000 /var/log/app.log > /tmp/trimmed && mv /tmp/trimmed /var/log/app.log
+```
+
+---
+
+### Quoting and Escaping in Bash
+
+Understanding quoting prevents an entire class of bugs in scripts and pipelines.
+
+```bash
+# === Single quotes: literal, no expansion ===
+echo 'Hello $USER'              # Hello $USER  (literal)
+echo '$HOME is not expanded'    # $HOME is not expanded
+
+# === Double quotes: allows variable and command expansion ===
+echo "Hello $USER"              # Hello alice
+echo "Home: $HOME"              # Home: /home/alice
+echo "Date: $(date)"           # Date: Tue Mar 3 ...
+
+# === No quotes: word splitting and glob expansion ===
+FILES="file1.txt file2.txt"
+cat $FILES           # cat receives TWO arguments: file1.txt and file2.txt
+cat "$FILES"         # cat receives ONE argument: "file1.txt file2.txt" (wrong!)
+
+# === When to quote ===
+# ALWAYS quote variables unless you specifically want word splitting:
+rm "$filename"                  # safe even if filename has spaces
+grep "$pattern" "$file"         # safe
+for f in "$@"; do ... done      # safe iteration over arguments
+
+# === Escaping special characters ===
+echo "Price: \$5"               # Price: $5
+echo "She said \"hello\""       # She said "hello"
+echo 'It'\''s a test'           # It's a test (end single quote, escaped quote, start single quote)
+
+# === $'...' — ANSI-C quoting (useful for special characters) ===
+echo $'tab\there'               # tab	here
+echo $'line1\nline2'            # two lines
+grep $'\t' file.txt             # search for tab character
+
+# === Quoting in awk ===
+# awk uses its own quoting; wrap awk in single quotes
+awk '{print $1}'                # $1 is an awk field, not a shell variable
+awk -v val="$SHELL_VAR" '{print val, $1}'    # pass shell variable via -v
+
+# === Quoting in find -exec ===
+find /var/log -name "*.log" -exec grep "error" {} \;
+# {} is the filename placeholder, \; terminates -exec
+
+# === Common pitfalls ===
+
+# WRONG: unquoted variable with spaces breaks commands
+FILE="my log file.txt"
+cat $FILE           # tries to cat THREE files: "my", "log", "file.txt"
+cat "$FILE"         # correct: cats "my log file.txt"
+
+# WRONG: glob expansion in variable
+DIR="*.txt"
+echo $DIR           # expands to actual filenames in current directory
+echo "$DIR"         # prints literal "*.txt"
+```
+
+---
+
+### Subshells and Command Substitution
+
+```bash
+# === Command substitution: $(command) ===
+# Captures stdout of a command as a string
+PODS=$(kubectl get pods -o name)
+echo "Found $(echo "$PODS" | wc -l) pods"
+
+# Backtick form is deprecated but still common in older scripts
+PODS=`kubectl get pods -o name`    # avoid this style
+
+# Nesting works naturally with $()
+echo "Kernel: $(uname -r) on $(hostname)"
+
+# === Subshells: (commands) ===
+# Runs commands in a child process; changes don't affect parent
+(cd /tmp && tar xf archive.tar)    # parent's CWD is unchanged
+echo "Still in $(pwd)"
+
+# === Process substitution: <(command) and >(command) ===
+# Treats command output as a file
+diff <(kubectl get pods -n staging) <(kubectl get pods -n production)
+
+# Use as an input file
+while read -r line; do
+  echo "Pod: $line"
+done < <(kubectl get pods -o name)
+
+# Write to multiple destinations simultaneously
+kubectl logs deploy/app | tee >(grep ERROR > errors.log) >(grep WARN > warnings.log)
+
+# === Pipe subshell gotcha ===
+# Variables set inside a pipe are lost (each pipe stage is a subshell)
+count=0
+cat file.txt | while read -r line; do
+  ((count++))
+done
+echo "$count"    # prints 0! The while loop ran in a subshell.
+
+# WORKAROUND 1: use process substitution instead of pipe
+count=0
+while read -r line; do
+  ((count++))
+done < <(cat file.txt)
+echo "$count"    # correct count
+
+# WORKAROUND 2: use lastpipe (bash 4.2+)
+shopt -s lastpipe
+count=0
+cat file.txt | while read -r line; do
+  ((count++))
+done
+echo "$count"    # correct count
+
+# WORKAROUND 3: redirect from a file
+count=0
+while read -r line; do
+  ((count++))
+done < file.txt
+echo "$count"    # correct count
+```
+
+---
+
+### Using `while read` Loops Safely
+
+`while read` is the idiomatic way to process lines in bash when awk/sed aren't enough (e.g., when you need to call external commands per line).
+
+```bash
+# === Basic safe pattern ===
+while IFS= read -r line; do
+  echo "Processing: $line"
+done < input.txt
+
+# IFS=        prevents leading/trailing whitespace stripping
+# -r          prevents backslash interpretation
+# Both are almost always what you want. ALWAYS use them.
+
+# === Reading fields from delimited data ===
+while IFS=: read -r user _ uid gid _ home shell; do
+  echo "$user (UID=$uid) uses $shell"
+done < /etc/passwd
+
+# === Reading from a command ===
+while IFS= read -r pod; do
+  echo "Checking $pod..."
+  kubectl describe "$pod" | grep -c "Warning"
+done < <(kubectl get pods -o name)
+
+# === Handling filenames with spaces or special characters ===
+# Use null-delimited input
+find /var/log -name "*.log" -print0 | while IFS= read -r -d '' file; do
+  echo "Size: $(stat -c '%s' "$file") - $file"
+done
+
+# === Reading tab-separated data ===
+while IFS=$'\t' read -r col1 col2 col3; do
+  echo "$col1 -> $col2 ($col3)"
+done < data.tsv
+
+# === Gotcha: commands inside the loop can consume stdin ===
+while IFS= read -r host; do
+  ssh "$host" "uptime"        # ssh reads from stdin, stealing remaining lines!
+done < hosts.txt
+# FIX: redirect ssh's stdin from /dev/null
+while IFS= read -r host; do
+  ssh -n "$host" "uptime"     # -n redirects stdin from /dev/null
+done < hosts.txt
+
+# === Alternative: use a different FD ===
+while IFS= read -r host <&3; do
+  ssh "$host" "uptime"
+done 3< hosts.txt
+```
+
+---
+
+### Exit Codes and Conditional Pipelines
+
+Every command returns an exit code: 0 = success, non-zero = failure. This is the foundation of conditional logic in shell scripts.
+
+```bash
+# === Check exit codes ===
+kubectl get pod my-pod
+echo $?    # 0 if found, 1 if not found
+
+# === && (AND): run next command only if previous succeeded ===
+kubectl apply -f deployment.yaml && echo "Applied successfully"
+
+# === || (OR): run next command only if previous failed ===
+kubectl get pod my-pod || echo "Pod not found"
+
+# === Combine && and || (poor man's if-then-else) ===
+grep -q "error" app.log && echo "Errors found" || echo "No errors"
+# CAUTION: if the echo after && fails, the || clause also runs.
+# For real if/else, use if/then/else.
+
+# === set -e: exit on any error ===
+set -e          # script exits immediately on any non-zero exit code
+set +e          # disable (useful temporarily)
+
+# === set -o pipefail: pipeline fails if ANY stage fails ===
+set -o pipefail
+kubectl get pods | grep "Missing" | wc -l
+# Without pipefail: exit code is always 0 (from wc)
+# With pipefail: exit code is 1 if kubectl fails
+
+# === ${PIPESTATUS[@]}: check individual pipeline stage exit codes ===
+false | true | false
+echo "${PIPESTATUS[@]}"    # 1 0 1
+
+# === Trap: run cleanup on exit ===
+trap 'rm -f /tmp/lockfile' EXIT
+trap 'echo "Error on line $LINENO"; exit 1' ERR
+
+# === Conditional patterns in scripts ===
+
+# Check if a command exists
+if command -v jq &>/dev/null; then
+  echo "jq is available"
+else
+  echo "jq is not installed"
+  exit 1
+fi
+
+# Retry pattern
+MAX_RETRIES=5
+for i in $(seq 1 $MAX_RETRIES); do
+  kubectl get pod my-pod -o jsonpath='{.status.phase}' | grep -q "Running" && break
+  echo "Attempt $i: pod not ready, waiting..."
+  sleep 5
+done
+
+# Timeout pattern
+timeout 60 bash -c 'until kubectl get pod my-pod -o jsonpath="{.status.phase}" | grep -q Running; do sleep 2; done'
+```
+
+---
+
+## Practice Section
+
+### Exercise 1: Log Analysis Basics
+
+Given this sample access log:
+
+```
+192.168.1.10 - - [15/Jan/2024:10:15:30 +0000] "GET /api/users HTTP/1.1" 200 1234
+10.0.0.5 - - [15/Jan/2024:10:15:31 +0000] "POST /api/login HTTP/1.1" 401 89
+192.168.1.10 - - [15/Jan/2024:10:15:32 +0000] "GET /api/users/1 HTTP/1.1" 200 567
+172.16.0.1 - - [15/Jan/2024:10:15:33 +0000] "DELETE /api/users/5 HTTP/1.1" 403 120
+10.0.0.5 - - [15/Jan/2024:10:15:34 +0000] "POST /api/login HTTP/1.1" 200 2048
+10.0.0.5 - - [15/Jan/2024:10:15:35 +0000] "GET /api/dashboard HTTP/1.1" 500 56
+192.168.1.10 - - [15/Jan/2024:10:15:36 +0000] "GET /api/users HTTP/1.1" 200 1234
+172.16.0.1 - - [15/Jan/2024:10:15:37 +0000] "PUT /api/users/3 HTTP/1.1" 200 890
+10.0.0.5 - - [15/Jan/2024:10:15:38 +0000] "GET /api/dashboard HTTP/1.1" 500 56
+192.168.1.20 - - [15/Jan/2024:10:15:39 +0000] "GET /health HTTP/1.1" 200 2
+```
+
+**Tasks:**
+1. Count the total number of requests.
+2. List unique IP addresses and how many requests each made.
+3. Find all requests that returned HTTP 4xx or 5xx status codes.
+4. Calculate the total bytes transferred (sum of the last field).
+5. Find the most frequently requested endpoint.
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. Total requests
+wc -l < access.log
+# 10
+
+# 2. Unique IPs with counts
+awk '{print $1}' access.log | sort | uniq -c | sort -rn
+#   4 10.0.0.5        (if using the sample above — adjust for actual data)
+#   3 192.168.1.10
+#   2 172.16.0.1
+#   1 192.168.1.20
+
+# 3. HTTP 4xx and 5xx responses
+awk '$9 ~ /^[45]/' access.log
+# Or: awk '$9 >= 400' access.log
+
+# 4. Total bytes transferred
+awk '{sum += $10} END {print sum}' access.log
+
+# 5. Most requested endpoint
+awk '{print $7}' access.log | sort | uniq -c | sort -rn | head -1
+```
+
+</details>
+
+---
+
+### Exercise 2: Kubernetes JSON Processing
+
+Given this JSON (simulating `kubectl get pods -o json`):
+
+```json
+{
+  "items": [
+    {"metadata": {"name": "web-abc12", "namespace": "production", "labels": {"app": "web"}},
+     "status": {"phase": "Running", "containerStatuses": [{"name": "web", "restartCount": 0, "ready": true}]}},
+    {"metadata": {"name": "api-def34", "namespace": "production", "labels": {"app": "api"}},
+     "status": {"phase": "Running", "containerStatuses": [{"name": "api", "restartCount": 15, "ready": true}]}},
+    {"metadata": {"name": "worker-ghi56", "namespace": "production", "labels": {"app": "worker"}},
+     "status": {"phase": "CrashLoopBackOff", "containerStatuses": [{"name": "worker", "restartCount": 142, "ready": false}]}},
+    {"metadata": {"name": "cache-jkl78", "namespace": "staging", "labels": {"app": "cache"}},
+     "status": {"phase": "Running", "containerStatuses": [{"name": "redis", "restartCount": 0, "ready": true}]}},
+    {"metadata": {"name": "db-mno90", "namespace": "staging", "labels": {"app": "db"}},
+     "status": {"phase": "Pending", "containerStatuses": [{"name": "postgres", "restartCount": 0, "ready": false}]}}
+  ]
+}
+```
+
+**Tasks:**
+1. List all pod names and their phases.
+2. Find pods that are not in "Running" phase.
+3. Find pods with restart count greater than 10.
+4. List all unique namespaces.
+5. Create a TSV output with columns: namespace, name, phase, restarts, ready.
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. Pod names and phases
+jq -r '.items[] | "\(.metadata.name) \(.status.phase)"' pods.json
+
+# 2. Not Running
+jq -r '.items[] | select(.status.phase != "Running") | "\(.metadata.name): \(.status.phase)"' pods.json
+
+# 3. Restart count > 10
+jq -r '.items[] | select(.status.containerStatuses[].restartCount > 10) | "\(.metadata.name) restarts=\(.status.containerStatuses[].restartCount)"' pods.json
+
+# 4. Unique namespaces
+jq -r '[.items[].metadata.namespace] | unique | .[]' pods.json
+
+# 5. TSV output
+jq -r '.items[] | [.metadata.namespace, .metadata.name, .status.phase, (.status.containerStatuses[0].restartCount | tostring), (.status.containerStatuses[0].ready | tostring)] | @tsv' pods.json | column -t
+```
+
+</details>
+
+---
+
+### Exercise 3: System Investigation
+
+**Tasks:**
+1. Find all files under `/etc` modified in the last 24 hours and display them sorted by modification time.
+2. List all listening TCP ports with the process name and PID, sorted by port number.
+3. Show the top 10 processes by memory usage, displaying only PID, user, %MEM, and command.
+4. Find all world-writable files under `/tmp` (excluding symbolic links).
+5. Display disk usage of `/var` subdirectories, sorted by size, in human-readable format.
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. Recently modified files under /etc
+find /etc -type f -mtime -1 -printf '%T+ %p\n' 2>/dev/null | sort -r
+
+# 2. Listening TCP ports sorted by port
+ss -tlnp | awk 'NR>1 {print $4, $NF}' | sort -t: -k2 -n | column -t
+
+# 3. Top 10 processes by memory
+ps aux --sort=-%mem | awk 'NR<=11 {printf "%-8s %-8s %6s  %s\n", $2, $1, $4, $11}'
+
+# 4. World-writable files under /tmp
+find /tmp -type f -perm -002 2>/dev/null -ls
+
+# 5. Disk usage of /var subdirectories
+du -sh /var/*/ 2>/dev/null | sort -rh
+```
+
+</details>
+
+---
+
+### Exercise 4: Text Transformation Pipeline
+
+Given this `/etc/passwd`-style input:
+
+```
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+deploy:x:1000:1000:Deploy User:/home/deploy:/bin/bash
+jenkins:x:1001:1001:Jenkins CI:/home/jenkins:/bin/bash
+nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+```
+
+**Tasks:**
+1. Extract only usernames and their shells, separated by a tab.
+2. Find all users whose shell is `/bin/bash`.
+3. Sort users by UID (third field) in descending order.
+4. Generate a report: "User USERNAME has UID UID and uses SHELL" for each entry.
+5. Find users with UID >= 1000 (regular users).
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. Usernames and shells
+awk -F: '{printf "%s\t%s\n", $1, $7}' passwd.txt
+# Or: cut -d: -f1,7 passwd.txt | tr ':' '\t'
+
+# 2. Users with /bin/bash
+awk -F: '$7 == "/bin/bash" {print $1}' passwd.txt
+
+# 3. Sort by UID descending
+sort -t: -k3 -rn passwd.txt
+
+# 4. Report
+awk -F: '{printf "User %s has UID %s and uses %s\n", $1, $3, $7}' passwd.txt
+
+# 5. UID >= 1000
+awk -F: '$3 >= 1000 {print $1, $3}' passwd.txt
+```
+
+</details>
+
+---
+
+### Exercise 5: Building Pipelines from Scratch
+
+**Tasks (use your system or simulate with sample data):**
+
+1. Build a pipeline that shows the top 5 largest files in `/var/log`, with human-readable sizes.
+2. Count how many unique shells are used in `/etc/passwd` and list them with counts.
+3. Generate a comma-separated list of all running Docker container names (or simulate).
+4. From `dmesg` output, extract unique error types and count their occurrences.
+5. Create a pipeline that monitors a log file for the word "CRITICAL" and sends each match to both a file and the terminal.
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. Top 5 largest files in /var/log
+find /var/log -type f -printf '%s %p\n' 2>/dev/null | sort -rn | head -5 | \
+  awk '{printf "%.2f MB  %s\n", $1/1048576, $2}'
+
+# 2. Unique shells with counts
+awk -F: '{print $7}' /etc/passwd | sort | uniq -c | sort -rn
+
+# 3. Comma-separated container names
+docker ps --format '{{.Names}}' | paste -sd','
+# Simulated: echo -e "nginx\nredis\npostgres" | paste -sd','
+
+# 4. Unique dmesg error types
+dmesg | grep -i "error" | sed 's/\[.*\] //' | sort | uniq -c | sort -rn
+
+# 5. Monitor and tee CRITICAL messages
+tail -F /var/log/app.log | grep --line-buffered "CRITICAL" | tee critical-alerts.log
+```
+
+</details>
+
+---
+
+### Exercise 6: sed Mastery
+
+**Tasks:**
+1. Replace all occurrences of `http://` with `https://` in a file, in-place.
+2. Remove all comment lines (starting with `#`) and blank lines from a config file.
+3. Add the prefix `[PROCESSED]` to every line in a log file.
+4. Extract only the value from lines matching `KEY=VALUE` format.
+5. Replace the image tag in a Kubernetes deployment YAML from `myapp:v1.0` to `myapp:v2.0`.
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. HTTP to HTTPS
+sed -i 's|http://|https://|g' urls.txt
+
+# 2. Remove comments and blank lines
+sed '/^#/d; /^$/d' config.conf
+# Or: sed -E '/^(#|$)/d' config.conf
+
+# 3. Prefix every line
+sed 's/^/[PROCESSED] /' app.log
+
+# 4. Extract values from KEY=VALUE
+sed -n 's/^[^=]*=//p' config.env
+# Or with specific key: sed -n 's/^DATABASE_URL=//p' config.env
+
+# 5. Replace image tag
+sed -i 's|image: myapp:v1.0|image: myapp:v2.0|' deployment.yaml
+# More robust: sed -i -E 's|(image: myapp:)v[0-9.]+|\1v2.0|' deployment.yaml
+```
+
+</details>
+
+---
+
+### Exercise 7: awk Aggregation
+
+Given this sample application log:
+
+```
+2024-01-15T10:00:01 INFO  /api/users      200 45ms
+2024-01-15T10:00:02 ERROR /api/users/1    500 1200ms
+2024-01-15T10:00:03 INFO  /api/health     200 2ms
+2024-01-15T10:00:04 WARN  /api/login      401 89ms
+2024-01-15T10:00:05 INFO  /api/users      200 52ms
+2024-01-15T10:00:06 ERROR /api/orders     500 3400ms
+2024-01-15T10:00:07 INFO  /api/health     200 1ms
+2024-01-15T10:00:08 INFO  /api/users      200 38ms
+2024-01-15T10:00:09 WARN  /api/login      401 156ms
+2024-01-15T10:00:10 INFO  /api/orders     200 230ms
+```
+
+**Tasks:**
+1. Count requests per log level (INFO, WARN, ERROR).
+2. Count requests per endpoint.
+3. Calculate average response time per endpoint (strip the "ms" suffix).
+4. Find the slowest request.
+5. Calculate the error rate (percentage of non-200 responses).
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. Requests per log level
+awk '{print $2}' app.log | sort | uniq -c | sort -rn
+# Or: awk '{count[$2]++} END {for (k in count) print count[k], k}' app.log
+
+# 2. Requests per endpoint
+awk '{count[$3]++} END {for (k in count) print count[k], k}' app.log | sort -rn
+
+# 3. Average response time per endpoint
+awk '{
+  gsub(/ms/, "", $5);
+  sum[$3] += $5;
+  count[$3]++
+}
+END {
+  for (ep in sum) printf "%-20s avg=%.1fms (n=%d)\n", ep, sum[ep]/count[ep], count[ep]
+}' app.log
+
+# 4. Slowest request
+awk '{gsub(/ms/,"",$5); if ($5+0 > max) {max=$5; line=$0}} END {print max"ms:", line}' app.log
+
+# 5. Error rate
+awk '{total++; if ($4 != 200) errors++} END {printf "%.1f%% errors (%d/%d)\n", errors/total*100, errors, total}' app.log
+```
+
+</details>
+
+---
+
+### Exercise 8: jq Challenges
+
+Given this JSON simulating AWS EC2 describe-instances output:
+
+```json
+{
+  "Reservations": [
+    {"Instances": [
+      {"InstanceId": "i-abc001", "InstanceType": "t3.medium", "State": {"Name": "running"},
+       "Tags": [{"Key": "Name", "Value": "web-1"}, {"Key": "Env", "Value": "prod"}],
+       "PrivateIpAddress": "10.0.1.10", "LaunchTime": "2024-01-01T00:00:00Z"}
+    ]},
+    {"Instances": [
+      {"InstanceId": "i-abc002", "InstanceType": "t3.large", "State": {"Name": "stopped"},
+       "Tags": [{"Key": "Name", "Value": "worker-1"}, {"Key": "Env", "Value": "prod"}],
+       "PrivateIpAddress": "10.0.1.11", "LaunchTime": "2024-01-05T00:00:00Z"}
+    ]},
+    {"Instances": [
+      {"InstanceId": "i-abc003", "InstanceType": "t3.micro", "State": {"Name": "running"},
+       "Tags": [{"Key": "Name", "Value": "test-1"}, {"Key": "Env", "Value": "staging"}],
+       "PrivateIpAddress": "10.0.2.10", "LaunchTime": "2024-01-10T00:00:00Z"}
+    ]},
+    {"Instances": [
+      {"InstanceId": "i-abc004", "InstanceType": "m5.xlarge", "State": {"Name": "running"},
+       "Tags": [{"Key": "Name", "Value": "db-1"}, {"Key": "Env", "Value": "prod"}],
+       "PrivateIpAddress": "10.0.1.20", "LaunchTime": "2023-06-15T00:00:00Z"}
+    ]}
+  ]
+}
+```
+
+**Tasks:**
+1. List all instance IDs and their states.
+2. Find all running instances in the "prod" environment.
+3. Create a formatted table: Name, InstanceId, Type, State, IP.
+4. Count instances per state.
+5. Find the oldest instance (by LaunchTime).
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. Instance IDs and states
+jq -r '.Reservations[].Instances[] | "\(.InstanceId) \(.State.Name)"' ec2.json
+
+# 2. Running prod instances
+jq -r '.Reservations[].Instances[] |
+  select(.State.Name == "running") |
+  select(.Tags[] | .Key == "Env" and .Value == "prod") |
+  .InstanceId' ec2.json
+
+# 3. Formatted table
+jq -r '.Reservations[].Instances[] |
+  [
+    (.Tags[] | select(.Key == "Name") | .Value),
+    .InstanceId,
+    .InstanceType,
+    .State.Name,
+    .PrivateIpAddress
+  ] | @tsv' ec2.json | column -t
+
+# 4. Count per state
+jq -r '[.Reservations[].Instances[].State.Name] | group_by(.) | map({state: .[0], count: length}) | .[] | "\(.state): \(.count)"' ec2.json
+
+# 5. Oldest instance
+jq -r '.Reservations[].Instances[] | "\(.LaunchTime) \(.InstanceId)"' ec2.json | sort | head -1
+```
+
+</details>
+
+---
+
+### Exercise 9: Real-World Pipelines
+
+**Tasks (build multi-stage pipelines):**
+
+1. Parse nginx access logs to find the top 10 IPs making requests to `/api/` endpoints, show count and IP.
+2. From `kubectl get events`, extract Warning events, group by reason, and show counts.
+3. Compare environment variables between two running containers and show differences.
+4. Find all Kubernetes secrets, decode their values, and search for a specific string.
+5. Generate a summary of disk usage by user under `/home`.
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. Top 10 IPs hitting /api/ endpoints
+grep '/api/' /var/log/nginx/access.log | \
+  awk '{print $1}' | \
+  sort | uniq -c | sort -rn | head -10
+
+# 2. Warning events by reason
+kubectl get events --field-selector type=Warning -o json | \
+  jq -r '.items[].reason' | \
+  sort | uniq -c | sort -rn
+
+# 3. Compare container environment variables
+diff \
+  <(docker exec container1 env | sort) \
+  <(docker exec container2 env | sort)
+
+# 4. Search decoded secrets for a string
+kubectl get secrets -o json | \
+  jq -r '.items[] | .metadata.name as $name | .data // {} | to_entries[] | "\($name) \(.key) \(.value | @base64d)"' | \
+  grep -i "password"
+
+# 5. Disk usage by user under /home
+du -s /home/*/ 2>/dev/null | \
+  sort -rn | \
+  awk '{printf "%.1f GB\t%s\n", $1/1048576, $2}'
+```
+
+</details>
+
+---
+
+### Exercise 10: Debugging and Troubleshooting
+
+**Scenario:** A Kubernetes pod named `api-server` in namespace `production` is returning 500 errors intermittently.
+
+**Tasks (describe the pipeline you'd build for each):**
+
+1. Tail the pod's logs and filter for error-level messages in real-time.
+2. Check the pod's restart count and last restart reason.
+3. Check the pod's resource usage vs its resource limits.
+4. Inspect recent Kubernetes events related to this pod.
+5. Check if the pod's node is under memory or disk pressure.
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. Real-time error monitoring
+kubectl logs -f api-server -n production | grep --line-buffered -iE "error|exception|panic|fatal"
+
+# 2. Restart count and reason
+kubectl get pod api-server -n production -o json | \
+  jq '{
+    restartCount: .status.containerStatuses[0].restartCount,
+    lastState: .status.containerStatuses[0].lastState,
+    ready: .status.containerStatuses[0].ready
+  }'
+
+# 3. Resource usage vs limits
+echo "=== Current Usage ==="
+kubectl top pod api-server -n production
+echo "=== Limits ==="
+kubectl get pod api-server -n production -o json | \
+  jq '.spec.containers[] | {name, resources}'
+
+# 4. Related events
+kubectl get events -n production --field-selector involvedObject.name=api-server --sort-by='.lastTimestamp' | tail -20
+
+# 5. Node pressure
+NODE=$(kubectl get pod api-server -n production -o jsonpath='{.spec.nodeName}')
+kubectl describe node "$NODE" | grep -A 10 "Conditions:"
+```
+
+</details>
+
+---
+
+### Exercise 11: Stream Redirection
+
+**Tasks:**
+1. Run a command and save stdout to `output.log` and stderr to `errors.log`.
+2. Run a command and merge stdout and stderr into one file.
+3. Discard stderr and keep only stdout.
+4. Swap stdout and stderr of a command.
+5. Append stdout to one file and stderr to another, without overwriting either.
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. Separate stdout and stderr
+command > output.log 2> errors.log
+
+# 2. Merge both to one file
+command > combined.log 2>&1
+# Or: command &> combined.log
+
+# 3. Discard stderr only
+command 2>/dev/null
+
+# 4. Swap stdout and stderr
+command 3>&1 1>&2 2>&3 3>&-
+
+# 5. Append to separate files
+command >> output.log 2>> errors.log
+```
+
+</details>
+
+---
+
+### Exercise 12: Process Management Investigation
+
+**Tasks:**
+1. Find all processes running as root that are using more than 1% CPU.
+2. List all zombie processes.
+3. Find which process is listening on port 8080.
+4. Count the number of threads for each Java process.
+5. Show the environment variables of a running process (by PID).
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. Root processes with >1% CPU
+ps aux | awk '$1 == "root" && $3 > 1.0 {print $2, $3"%", $11}'
+
+# 2. Zombie processes
+ps aux | awk '$8 == "Z" || $8 ~ /Z/ {print $2, $11}'
+# Or: ps -eo pid,stat,cmd | grep "^.*Z"
+
+# 3. Process on port 8080
+ss -tlnp | grep ':8080'
+# Or: lsof -i :8080
+
+# 4. Thread count for Java processes
+ps -eo pid,nlwp,cmd | grep '[j]ava' | awk '{print "PID="$1, "Threads="$2, $3}'
+
+# 5. Environment of a process
+cat /proc/<PID>/environ | tr '\0' '\n'
+# Or: strings /proc/<PID>/environ
+```
+
+</details>
+
+---
+
+### Exercise 13: Comprehensive Pipeline Challenge
+
+**Scenario:** You have a web server access log and need to generate a full incident report.
+
+Build pipelines to answer these questions:
+
+1. What's the total number of requests in the log?
+2. What's the breakdown by HTTP method (GET, POST, PUT, DELETE)?
+3. What are the top 10 most requested URLs?
+4. What's the error rate (4xx + 5xx responses)?
+5. Which hour of the day has the most traffic?
+6. What's the average response size in bytes?
+7. List all IPs that received a 403 (Forbidden) response.
+8. What percentage of requests are from the top 3 IPs?
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+LOG="/var/log/nginx/access.log"
+
+# 1. Total requests
+wc -l < "$LOG"
+
+# 2. Breakdown by HTTP method
+awk '{print $6}' "$LOG" | tr -d '"' | sort | uniq -c | sort -rn
+
+# 3. Top 10 URLs
+awk '{print $7}' "$LOG" | sort | uniq -c | sort -rn | head -10
+
+# 4. Error rate
+awk '{total++; if ($9 >= 400) errors++} END {printf "%.2f%% (%d/%d)\n", errors/total*100, errors, total}' "$LOG"
+
+# 5. Busiest hour
+awk '{split($4,a,":"); print a[2]":00"}' "$LOG" | sort | uniq -c | sort -rn | head -5
+
+# 6. Average response size
+awk '{sum+=$10; n++} END {printf "%.0f bytes\n", sum/n}' "$LOG"
+
+# 7. IPs with 403 responses
+awk '$9 == 403 {print $1}' "$LOG" | sort -u
+
+# 8. Top 3 IPs as percentage of total
+awk '{ips[$1]++; total++} END {
+  n=asorti(ips, sorted, "@val_num_desc");
+  top3=0;
+  for (i=1; i<=3 && i<=n; i++) { top3 += ips[sorted[i]]; printf "%s: %d\n", sorted[i], ips[sorted[i]] }
+  printf "Top 3 = %.1f%% of total (%d/%d)\n", top3/total*100, top3, total
+}' "$LOG"
+```
+
+</details>
+
+---
+
+### Exercise 14: Security Audit Pipeline
+
+**Tasks:**
+1. Find all SUID binaries on the system.
+2. List all users with UID 0 (root-equivalent accounts).
+3. Find files in `/etc` that are world-writable.
+4. Check for SSH keys with overly permissive permissions.
+5. Find all cron jobs across all users.
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. SUID binaries
+find / -type f -perm -4000 2>/dev/null | xargs ls -la
+
+# 2. UID 0 users
+awk -F: '$3 == 0 {print $1}' /etc/passwd
+
+# 3. World-writable files in /etc
+find /etc -type f -perm -002 2>/dev/null -ls
+
+# 4. SSH keys with wrong permissions
+find /home -name "id_*" -o -name "*.pem" 2>/dev/null | \
+  xargs stat -c '%a %n' 2>/dev/null | \
+  awk '$1 != "600" && $1 != "400" {print "INSECURE:", $0}'
+
+# 5. All cron jobs
+for user in $(cut -d: -f1 /etc/passwd); do
+  crons=$(crontab -l -u "$user" 2>/dev/null)
+  [ -n "$crons" ] && echo "=== $user ===" && echo "$crons"
+done
+# Also check system cron
+cat /etc/crontab
+ls -la /etc/cron.d/ /etc/cron.daily/ /etc/cron.hourly/ 2>/dev/null
+```
+
+</details>
+
+---
+
+### Exercise 15: Data Format Conversion
+
+**Tasks:**
+1. Convert a CSV file to a JSON array of objects (using awk or jq).
+2. Convert JSON output to CSV.
+3. Convert a properties file (`key=value`) to JSON.
+4. Convert YAML to JSON (using yq or python).
+5. Transpose a TSV file (swap rows and columns).
+
+<details>
+<summary>Solutions</summary>
+
+```bash
+# 1. CSV to JSON (using jq)
+# Assumes first line is headers
+head -1 data.csv | tr ',' '\n' > /tmp/headers
+tail -n +2 data.csv | while IFS=, read -r -a fields; do
+  jq -n --arg h "$(cat /tmp/headers)" --arg v "$(IFS=,; echo "${fields[*]}")" '
+    ($h | split("\n")) as $keys |
+    ($v | split(",")) as $vals |
+    [range($keys | length)] | map({($keys[.]): $vals[.]}) | add
+  '
+done | jq -s '.'
+
+# Simpler approach for well-formed CSV using awk:
+awk -F, 'NR==1 {split($0,h); next} {
+  printf "{";
+  for(i=1;i<=NF;i++) printf "\"%s\":\"%s\"%s", h[i], $i, (i<NF?",":"");
+  print "}"
+}' data.csv | jq -s '.'
+
+# 2. JSON to CSV
+echo '[{"name":"Alice","age":30},{"name":"Bob","age":25}]' | \
+  jq -r '(.[0] | keys_unsorted) as $k | $k, (.[] | [.[$k[]]] | map(tostring)) | @csv'
+
+# 3. Properties to JSON
+awk -F= '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$1); gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); printf "\"%s\": \"%s\",\n", $1, $2}' config.properties | \
+  sed '$ s/,$//' | sed '1s/^/{/' | sed '$ a\}'
+# Or more robustly:
+jq -Rn '[inputs | split("=") | {(.[0]): .[1:] | join("=")}] | add' config.properties
+
+# 4. YAML to JSON
+yq -o json deployment.yaml
+# Or with Python:
+python3 -c "import yaml,json,sys; json.dump(yaml.safe_load(sys.stdin), sys.stdout, indent=2)" < deployment.yaml
+
+# 5. Transpose a TSV
+awk -F'\t' '{for(i=1;i<=NF;i++) a[i][NR]=$i}
+  END {for(i=1;i<=length(a);i++) {for(j=1;j<=NR;j++) printf "%s%s", a[i][j], (j<NR?"\t":""); print ""}}' data.tsv
+```
+
+</details>

@@ -1,0 +1,2335 @@
+---
+title: CKA Exam Reference
+sidebarTitle: CKA Exam Reference
+---
+
+## CKA Exam Reference — Complete Study & Scenario Guide
+
+Based on official **2025 curriculum** (effective February 18, 2025).  
+**Kubernetes version**: v1.32+  
+**Exam format**: 2 hours, performance-based, ~15–20 tasks, passing score **66%**.  
+You work across **6 different clusters** — **always check context before each task**.  
+Only allowed resource during the exam: [`kubernetes.io/docs`](https://kubernetes.io/docs/).
+
+### Domain weights
+
+- **Troubleshooting**: 30%
+- **Cluster architecture, installation & configuration**: 25%
+- **Services and networking**: 20%
+- **Workloads and scheduling**: 15%
+- **Storage**: 10%
+
+### High‑value exam tips
+
+- **Aliases**: Set useful `kubectl` aliases immediately when the exam starts (`k`, `kn`, etc.).
+- **Context**: Always switch to the **given context** before each task.
+- **Dry‑run YAML**: Use `--dry-run=client -o yaml` to generate YAML quickly.
+- **Docs search**: Prefer `kubectl explain` and the search box at `kubernetes.io/docs`.
+- **Timeboxing**: Skip hard questions and come back later.
+
+---
+
+### Full shell / command reference
+
+The following section is kept as executable shell/script content for fast copy‑paste during practice.  
+Use it as a terminal‑friendly cheatsheet while you study.
+
+```bash
+#!/usr/bin/env bash
+# =============================================================================
+# CKA EXAM REFERENCE — COMPLETE STUDY & SCENARIO GUIDE
+# =============================================================================
+# Based on official 2025 curriculum (effective February 18, 2025)
+# Kubernetes version: v1.32+
+# Exam: 2 hours, performance-based, ~15-20 tasks, passing score: 66%
+# You work across 6 different clusters — ALWAYS check context before each task
+# Only allowed resource during exam: kubernetes.io/docs
+#
+# DOMAIN WEIGHTS:
+#   Troubleshooting                          30%
+#   Cluster Architecture, Install & Config   25%
+#   Servicing and Networking                 20%
+#   Workloads and Scheduling                 15%
+#   Storage                                  10%
+#
+# EXAM TIPS:
+#   - Set aliases immediately when exam starts (k, kn, etc.)
+#   - Always switch context before each task (given in the question)
+#   - Use --dry-run=client -o yaml to generate YAML fast
+#   - Use kubectl explain to find field names without googling
+#   - Skip hard questions, come back to them
+#   - Use docs search: kubernetes.io/docs — know what to search for
+# =============================================================================
+
+# ===========================================================================
+# EXAM START — RUN THESE IMMEDIATELY
+# ===========================================================================
+
+# Set aliases (some are pre-set in exam, add your own)
+alias k=kubectl
+alias kn='kubectl -n'
+alias kg='kubectl get'
+alias kd='kubectl describe'
+alias kl='kubectl logs'
+alias ke='kubectl exec -it'
+export do='--dry-run=client -o yaml'   # usage: k run pod1 --image=nginx $do
+
+# Enable bash completion
+source <(kubectl completion bash)
+complete -F __start_kubectl k
+
+# Set vi mode for faster editing (optional)
+set -o vi
+
+# Check current context before EVERY task
+kubectl config get-contexts
+kubectl config current-context
+
+# Switch context (given in each exam question — DO THIS FIRST)
+kubectl config use-context <context-name>
+
+# ===========================================================================
+# SECTION 1: CLUSTER ARCHITECTURE, INSTALLATION & CONFIGURATION (25%)
+# ===========================================================================
+
+# ===========================================================================
+# 1A: RBAC — Role-Based Access Control
+# ===========================================================================
+
+# --- Core RBAC objects ---
+# Role        — namespace-scoped permissions
+# ClusterRole — cluster-scoped permissions (or reusable across namespaces)
+# RoleBinding        — bind Role or ClusterRole to subject (in a namespace)
+# ClusterRoleBinding — bind ClusterRole to subject cluster-wide
+
+# --- Create Role (namespace-scoped) ---
+kubectl create role pod-reader \
+  --verb=get,list,watch \
+  --resource=pods \
+  --namespace=my-ns
+
+# Role with specific resource names
+kubectl create role pod-reader \
+  --verb=get \
+  --resource=pods \
+  --resource-name=my-pod \
+  --namespace=my-ns
+
+# Role for multiple resources
+kubectl create role app-role \
+  --verb=get,list,watch,create,update,patch,delete \
+  --resource=pods,deployments,services \
+  --namespace=my-ns
+
+# --- Create ClusterRole ---
+kubectl create clusterrole node-reader \
+  --verb=get,list,watch \
+  --resource=nodes
+
+kubectl create clusterrole secret-admin \
+  --verb='*' \
+  --resource=secrets
+
+# --- Create RoleBinding ---
+# Bind Role to a User
+kubectl create rolebinding pod-reader-binding \
+  --role=pod-reader \
+  --user=alice \
+  --namespace=my-ns
+
+# Bind Role to a ServiceAccount
+kubectl create rolebinding pod-reader-binding \
+  --role=pod-reader \
+  --serviceaccount=my-ns:my-sa \
+  --namespace=my-ns
+
+# Bind ClusterRole in a specific namespace (gives namespace-scoped access)
+kubectl create rolebinding admin-binding \
+  --clusterrole=admin \
+  --user=alice \
+  --namespace=my-ns
+
+# --- Create ClusterRoleBinding ---
+kubectl create clusterrolebinding node-reader-binding \
+  --clusterrole=node-reader \
+  --user=alice
+
+kubectl create clusterrolebinding sa-cluster-admin \
+  --clusterrole=cluster-admin \
+  --serviceaccount=kube-system:my-sa
+
+# --- Verify permissions ---
+kubectl auth can-i get pods --as=alice
+kubectl auth can-i get pods --as=alice --namespace=my-ns
+kubectl auth can-i get pods --as=system:serviceaccount:my-ns:my-sa
+kubectl auth can-i '*' '*'                          # is admin?
+kubectl auth can-i get pods --as=alice --all-namespaces
+
+# EXAM SCENARIO 1: Create SA with specific permissions
+# "Create a ServiceAccount named 'deployer' in namespace 'apps'.
+#  Create a Role that allows get, list, watch on deployments.
+#  Bind the Role to the ServiceAccount."
+kubectl create namespace apps
+kubectl create serviceaccount deployer -n apps
+kubectl create role deployment-viewer \
+  --verb=get,list,watch \
+  --resource=deployments \
+  -n apps
+kubectl create rolebinding deployer-binding \
+  --role=deployment-viewer \
+  --serviceaccount=apps:deployer \
+  -n apps
+# Verify:
+kubectl auth can-i get deployments \
+  --as=system:serviceaccount:apps:deployer -n apps    # should be: yes
+
+# EXAM SCENARIO 2: ClusterRole for node info
+# "Create a ClusterRole 'node-viewer' that allows get,list on nodes.
+#  Bind it to user 'bob' cluster-wide."
+kubectl create clusterrole node-viewer --verb=get,list --resource=nodes
+kubectl create clusterrolebinding bob-node-viewer \
+  --clusterrole=node-viewer --user=bob
+kubectl auth can-i list nodes --as=bob               # yes
+kubectl auth can-i list pods --as=bob                # no
+
+# --- RBAC YAML examples ---
+cat << 'EOF'
+# Role YAML
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-manager
+  namespace: my-ns
+rules:
+- apiGroups: [""]           # "" = core API group (pods, services, configmaps)
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "create", "delete"]
+- apiGroups: ["apps"]       # apps group (deployments, replicasets)
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch"]
+---
+# RoleBinding YAML
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-manager-binding
+  namespace: my-ns
+subjects:
+- kind: User
+  name: alice
+  apiGroup: rbac.authorization.k8s.io
+- kind: ServiceAccount
+  name: my-sa
+  namespace: my-ns
+roleRef:
+  kind: Role                # Role or ClusterRole
+  name: pod-manager
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+# ===========================================================================
+# 1B: KUBEADM — Cluster Bootstrap & Upgrade
+# ===========================================================================
+
+# --- Initialize a cluster ---
+kubeadm init \
+  --pod-network-cidr=10.244.0.0/16 \          # for Flannel CNI
+  --apiserver-advertise-address=<master-ip> \
+  --control-plane-endpoint=<lb-ip>:6443        # for HA setup
+
+# Set up kubeconfig after init (as regular user)
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# --- Join a worker node ---
+kubeadm token create --print-join-command      # get join command on master
+# Run the output on worker node (as root):
+# kubeadm join <master-ip>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>
+
+# --- Join a control plane node (HA) ---
+kubeadm init phase upload-certs --upload-certs # get certificate key
+# Run on new control plane node:
+# kubeadm join <lb>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash> --control-plane --certificate-key <key>
+
+# --- CLUSTER UPGRADE (most tested kubeadm topic!) ---
+# Must upgrade one minor version at a time (1.29 -> 1.30 -> 1.31)
+# Always upgrade control plane first, then workers
+
+# Step 1: Upgrade kubeadm on control plane
+apt-mark unhold kubeadm && \
+apt-get update && \
+apt-get install -y kubeadm=1.30.0-1.1 && \
+apt-mark hold kubeadm
+
+# Step 2: Verify upgrade plan
+kubeadm upgrade plan                            # shows available versions
+
+# Step 3: Apply upgrade
+kubeadm upgrade apply v1.30.0
+
+# Step 4: Drain control plane node
+kubectl drain <control-plane-node> --ignore-daemonsets
+
+# Step 5: Upgrade kubelet and kubectl on control plane
+apt-mark unhold kubelet kubectl && \
+apt-get install -y kubelet=1.30.0-1.1 kubectl=1.30.0-1.1 && \
+apt-mark hold kubelet kubectl
+
+# Step 6: Restart kubelet
+systemctl daemon-reload
+systemctl restart kubelet
+
+# Step 7: Uncordon control plane
+kubectl uncordon <control-plane-node>
+
+# Step 8: Upgrade each worker node (repeat for each)
+kubectl drain <worker-node> --ignore-daemonsets --delete-emptydir-data
+# SSH to worker node, then:
+apt-mark unhold kubeadm && apt-get install -y kubeadm=1.30.0-1.1 && apt-mark hold kubeadm
+kubeadm upgrade node                            # upgrades node configuration
+apt-mark unhold kubelet kubectl && \
+apt-get install -y kubelet=1.30.0-1.1 kubectl=1.30.0-1.1 && \
+apt-mark hold kubelet kubectl
+systemctl daemon-reload && systemctl restart kubelet
+# Back on master:
+kubectl uncordon <worker-node>
+
+# Verify upgrade
+kubectl get nodes                               # should show new version
+
+# --- etcd backup and restore (CRITICAL exam topic) ---
+
+# Backup etcd
+ETCDCTL_API=3 etcdctl snapshot save /opt/etcd-backup.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+
+# Verify backup
+ETCDCTL_API=3 etcdctl snapshot status /opt/etcd-backup.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  --write-out=table
+
+# Restore etcd from backup
+ETCDCTL_API=3 etcdctl snapshot restore /opt/etcd-backup.db \
+  --data-dir=/var/lib/etcd-restored \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+
+# Update etcd manifest to use new data dir
+sudo vim /etc/kubernetes/manifests/etcd.yaml
+# Change: --data-dir=/var/lib/etcd
+# To:     --data-dir=/var/lib/etcd-restored
+# Also update hostPath volume to /var/lib/etcd-restored
+
+# Wait for etcd to restart, then verify cluster
+kubectl get nodes
+
+# EXAM SCENARIO 3: etcd backup
+# "Back up the etcd database to /opt/backup/etcd-snapshot.db"
+mkdir -p /opt/backup
+# Find etcd certs location:
+kubectl describe pod etcd-<master> -n kube-system | grep -E "cert|key|ca"
+# Or check the manifest:
+cat /etc/kubernetes/manifests/etcd.yaml | grep -E "cert|key|trusted"
+
+ETCDCTL_API=3 etcdctl snapshot save /opt/backup/etcd-snapshot.db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+
+# ===========================================================================
+# 1C: HELM & KUSTOMIZE
+# ===========================================================================
+
+# --- Helm (2025 exam addition) ---
+helm version
+helm repo add stable https://charts.helm.sh/stable
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo update                                # refresh all repos
+helm repo list                                  # list added repos
+
+helm search repo nginx                          # search for nginx chart
+helm search hub nginx                           # search Artifact Hub
+
+helm install my-release bitnami/nginx           # install chart
+helm install my-release bitnami/nginx \
+  --namespace my-ns \
+  --create-namespace \
+  --set replicaCount=2 \
+  --set service.type=NodePort
+
+helm install my-release bitnami/nginx -f values.yaml  # with values file
+
+helm list                                       # list installed releases
+helm list -A                                    # all namespaces
+helm status my-release                          # release status
+helm get values my-release                      # values used
+helm get manifest my-release                    # rendered manifests
+
+helm upgrade my-release bitnami/nginx --set replicaCount=3
+helm upgrade --install my-release bitnami/nginx # install if not exists
+helm rollback my-release 1                      # rollback to revision 1
+helm history my-release                         # revision history
+
+helm uninstall my-release                       # uninstall
+helm uninstall my-release --keep-history        # keep history
+
+helm template my-release bitnami/nginx          # render templates without installing
+helm template my-release bitnami/nginx > rendered.yaml
+
+# EXAM SCENARIO 4: Install with Helm
+# "Install the bitnami/apache chart as 'my-apache' in namespace 'web',
+#  set replicaCount to 2."
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo update
+helm install my-apache bitnami/apache \
+  --namespace web \
+  --create-namespace \
+  --set replicaCount=2
+
+# --- Kustomize (2025 exam addition) ---
+kubectl apply -k ./kustomize-dir/               # apply kustomization
+kubectl diff -k ./kustomize-dir/                # diff what would change
+kubectl delete -k ./kustomize-dir/
+kubectl kustomize ./kustomize-dir/              # print rendered manifests
+
+# kustomization.yaml structure:
+cat << 'EOF'
+# kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: production              # override namespace for all resources
+namePrefix: prod-                  # add prefix to all names
+nameSuffix: -v2                    # add suffix to all names
+resources:                         # base resources to include
+  - deployment.yaml
+  - service.yaml
+  - ../../base                     # reference a base directory
+images:                            # override image tags
+  - name: nginx
+    newTag: 1.26
+  - name: myapp
+    newName: myrepo/myapp
+    newTag: v2.0
+configMapGenerator:                # generate ConfigMaps
+  - name: app-config
+    literals:
+      - KEY=value
+patches:                           # patch specific fields
+  - path: replica-patch.yaml
+  - target:
+      kind: Deployment
+      name: my-app
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+EOF
+
+# ===========================================================================
+# 1D: CRDs & OPERATORS
+# ===========================================================================
+
+kubectl get crds                                # list all CRDs
+kubectl get crd myapps.example.com -o yaml      # full CRD spec
+kubectl describe crd myapps.example.com         # schema and versions
+
+# Interact with custom resources (once CRD is installed)
+kubectl get myapps                              # list custom resource instances
+kubectl get myapps -A
+kubectl describe myapp my-instance
+kubectl apply -f my-app-instance.yaml
+kubectl delete myapp my-instance
+
+# Check operator is running
+kubectl get pods -n <operator-namespace>
+kubectl logs -n <operator-namespace> deployment/<operator>
+
+# EXAM SCENARIO 5: Install an operator via Helm
+# "Install the cert-manager operator in namespace cert-manager"
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --set installCRDs=true
+
+# ===========================================================================
+# 1E: EXTENSION INTERFACES (CNI, CSI, CRI)
+# ===========================================================================
+
+# CNI (Container Network Interface) — handles pod networking
+# Check which CNI is installed:
+ls /etc/cni/net.d/                              # CNI config files
+ls /opt/cni/bin/                                # CNI binaries
+kubectl get pods -n kube-system | grep -E "flannel|calico|cilium|weave"
+
+# Install Flannel CNI
+kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+
+# Install Calico CNI
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
+
+# CSI (Container Storage Interface) — handles storage
+kubectl get storageclass                        # shows CSI provisioners
+kubectl get csidrivers                          # installed CSI drivers
+kubectl get csinodes                            # CSI node info
+
+# CRI (Container Runtime Interface) — handles containers
+# Check container runtime on a node:
+kubectl get node <node> -o jsonpath='{.status.nodeInfo.containerRuntimeVersion}'
+# Common: containerd, cri-o
+
+# Check containerd:
+systemctl status containerd
+crictl info                                     # crictl = CRI CLI tool
+crictl ps                                       # list running containers
+crictl pods                                     # list pods
+crictl images                                   # list images
+
+# ===========================================================================
+# SECTION 2: WORKLOADS & SCHEDULING (15%)
+# ===========================================================================
+
+# ===========================================================================
+# 2A: DEPLOYMENTS — ROLLING UPDATES & ROLLBACKS
+# ===========================================================================
+
+# Create deployment
+kubectl create deployment my-app \
+  --image=nginx:1.25 \
+  --replicas=3 \
+  --namespace=my-ns
+
+# Generate deployment YAML
+kubectl create deployment my-app --image=nginx --replicas=3 $do > deployment.yaml
+
+# Update image (triggers rolling update)
+kubectl set image deployment/my-app nginx=nginx:1.26
+kubectl set image deployment/my-app nginx=nginx:1.26 --record
+
+# Watch rolling update
+kubectl rollout status deployment/my-app
+kubectl rollout status deployment/my-app --timeout=5m
+
+# Rollback
+kubectl rollout undo deployment/my-app           # to previous version
+kubectl rollout undo deployment/my-app --to-revision=2  # to specific revision
+kubectl rollout history deployment/my-app        # see revision history
+kubectl rollout history deployment/my-app --revision=2  # details of revision
+
+# Pause/resume rolling update
+kubectl rollout pause deployment/my-app
+kubectl rollout resume deployment/my-app
+
+# Scale
+kubectl scale deployment my-app --replicas=5
+
+# Deployment YAML with rolling update strategy:
+cat << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: my-ns
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-app
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1           # max pods above desired during update
+      maxUnavailable: 0     # max pods below desired during update
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.25
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+EOF
+
+# EXAM SCENARIO 6: Rolling update and rollback
+# "Update deployment 'web' image to nginx:1.26. If it fails, rollback."
+kubectl set image deployment/web nginx=nginx:1.26
+kubectl rollout status deployment/web
+# If broken:
+kubectl rollout undo deployment/web
+
+# ===========================================================================
+# 2B: CONFIGMAPS & SECRETS
+# ===========================================================================
+
+# --- ConfigMaps ---
+kubectl create configmap app-config \
+  --from-literal=ENV=production \
+  --from-literal=LOG_LEVEL=info
+
+kubectl create configmap app-config --from-file=config.yaml
+kubectl create configmap app-config --from-env-file=.env
+
+# Use ConfigMap in pod — environment variables
+cat << 'EOF'
+spec:
+  containers:
+  - name: app
+    image: nginx
+    env:
+    - name: MY_ENV                      # individual key
+      valueFrom:
+        configMapKeyRef:
+          name: app-config
+          key: ENV
+    envFrom:                            # all keys as env vars
+    - configMapRef:
+        name: app-config
+    volumeMounts:
+    - name: config-vol
+      mountPath: /etc/config            # mount as files
+  volumes:
+  - name: config-vol
+    configMap:
+      name: app-config
+      items:                            # optional: select specific keys
+      - key: config.yaml
+        path: app-config.yaml
+EOF
+
+# --- Secrets ---
+kubectl create secret generic db-secret \
+  --from-literal=username=admin \
+  --from-literal=password=s3cr3t
+
+kubectl create secret generic db-secret --from-env-file=.env.secret
+kubectl create secret tls my-tls --cert=tls.crt --key=tls.key
+
+# Decode a secret value
+kubectl get secret db-secret -o jsonpath='{.data.password}' | base64 -d
+
+# Use Secret in pod
+cat << 'EOF'
+spec:
+  containers:
+  - name: app
+    image: nginx
+    env:
+    - name: DB_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: db-secret
+          key: password
+    envFrom:
+    - secretRef:
+        name: db-secret
+    volumeMounts:
+    - name: secret-vol
+      mountPath: /etc/secrets
+      readOnly: true
+  volumes:
+  - name: secret-vol
+    secret:
+      secretName: db-secret
+EOF
+
+# ===========================================================================
+# 2C: AUTOSCALING
+# ===========================================================================
+
+# HorizontalPodAutoscaler (HPA) — scale based on metrics
+kubectl autoscale deployment my-app \
+  --min=2 --max=10 --cpu-percent=80
+
+kubectl get hpa
+kubectl describe hpa my-app
+
+# HPA YAML
+cat << 'EOF'
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 70
+EOF
+
+# VerticalPodAutoscaler (VPA) — adjust resource requests/limits
+# Requires VPA controller installed separately
+
+# ===========================================================================
+# 2D: POD SCHEDULING — NODE SELECTORS, AFFINITY, TAINTS, TOLERATIONS
+# ===========================================================================
+
+# --- nodeSelector (simple, exact match) ---
+cat << 'EOF'
+spec:
+  nodeSelector:
+    disktype: ssd
+    kubernetes.io/os: linux
+EOF
+
+# Label a node for nodeSelector:
+kubectl label node my-node disktype=ssd
+
+# --- nodeAffinity (flexible rules) ---
+cat << 'EOF'
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:   # hard rule
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: disktype
+            operator: In                    # In, NotIn, Exists, DoesNotExist, Gt, Lt
+            values: [ssd, nvme]
+      preferredDuringSchedulingIgnoredDuringExecution:  # soft rule (try to)
+      - weight: 100                         # 1-100
+        preference:
+          matchExpressions:
+          - key: zone
+            operator: In
+            values: [eu-west-1a]
+EOF
+
+# --- podAffinity & podAntiAffinity ---
+cat << 'EOF'
+spec:
+  affinity:
+    podAffinity:                           # schedule near pods with these labels
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: app
+            operator: In
+            values: [cache]
+        topologyKey: kubernetes.io/hostname  # same node
+    podAntiAffinity:                       # avoid scheduling near pods with these labels
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app: my-app
+          topologyKey: kubernetes.io/hostname  # spread across nodes
+EOF
+
+# --- Taints & Tolerations ---
+# Taint a node (repels pods without toleration)
+kubectl taint node my-node key=value:NoSchedule   # don't schedule new pods
+kubectl taint node my-node key=value:NoExecute    # evict existing + don't schedule
+kubectl taint node my-node key=value:PreferNoSchedule  # soft: try not to schedule
+kubectl taint node my-node key:NoSchedule-         # remove taint
+
+# Add toleration to pod so it CAN schedule on tainted node
+cat << 'EOF'
+spec:
+  tolerations:
+  - key: "key"
+    operator: "Equal"         # Equal or Exists
+    value: "value"
+    effect: "NoSchedule"      # NoSchedule, NoExecute, PreferNoSchedule
+  - key: "special"
+    operator: "Exists"        # tolerate any value
+    effect: "NoExecute"
+    tolerationSeconds: 3600   # stay for 3600s after taint, then evict
+EOF
+
+# --- Priority Classes ---
+cat << 'EOF'
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000000                # higher number = higher priority
+globalDefault: false
+description: "For critical workloads"
+---
+spec:
+  priorityClassName: high-priority
+EOF
+
+# --- Resource Limits & Requests ---
+cat << 'EOF'
+spec:
+  containers:
+  - name: app
+    image: nginx
+    resources:
+      requests:               # minimum guaranteed, used for scheduling
+        cpu: "100m"           # 100 millicores = 0.1 CPU
+        memory: "128Mi"       # 128 mebibytes
+      limits:                 # maximum allowed
+        cpu: "500m"           # CPU throttled if exceeded
+        memory: "512Mi"       # OOMKilled if exceeded
+EOF
+
+# LimitRange: default limits for a namespace
+cat << 'EOF'
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: my-ns
+spec:
+  limits:
+  - type: Container
+    default:                  # default limit if not specified
+      cpu: 200m
+      memory: 256Mi
+    defaultRequest:           # default request if not specified
+      cpu: 100m
+      memory: 128Mi
+    max:                      # maximum allowed
+      cpu: "2"
+      memory: 1Gi
+    min:                      # minimum allowed
+      cpu: 50m
+      memory: 64Mi
+EOF
+
+# ResourceQuota: limit total resources in a namespace
+cat << 'EOF'
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ns-quota
+  namespace: my-ns
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "20"
+    services: "10"
+    persistentvolumeclaims: "5"
+    secrets: "20"
+    configmaps: "20"
+EOF
+
+# --- Static Pods (run by kubelet directly, not API server) ---
+# Located in: /etc/kubernetes/manifests/ (by default)
+# Control plane components ARE static pods (kube-apiserver, etcd, etc.)
+
+ls /etc/kubernetes/manifests/                   # kube-apiserver.yaml, etcd.yaml, etc.
+
+# Create a static pod:
+cat << 'EOF' > /etc/kubernetes/manifests/my-static-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-static-pod
+  namespace: kube-system
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.25
+EOF
+# Kubelet picks it up automatically, creates pod named: my-static-pod-<node-name>
+
+# Find static pod path if non-default:
+systemctl cat kubelet | grep config          # find kubelet config file
+cat /var/lib/kubelet/config.yaml | grep staticPodPath
+
+# EXAM SCENARIO 7: Schedule pod on specific node
+# "Create a pod 'analyzer' on node 'worker-2' using node affinity"
+cat << 'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: analyzer
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+            - worker-2
+  containers:
+  - name: analyzer
+    image: nginx
+EOF
+
+# ===========================================================================
+# 2E: DAEMONSETS, JOBS, CRONJOBS
+# ===========================================================================
+
+# --- DaemonSet: one pod per node ---
+cat << 'EOF'
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-agent
+spec:
+  selector:
+    matchLabels:
+      app: node-agent
+  template:
+    metadata:
+      labels:
+        app: node-agent
+    spec:
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule                  # run on control plane too
+      containers:
+      - name: agent
+        image: my-agent:v1
+EOF
+
+# --- Job: run to completion ---
+kubectl create job my-job --image=busybox -- sh -c "echo hello"
+
+cat << 'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: my-job
+spec:
+  completions: 5              # total successful completions needed
+  parallelism: 2              # run 2 pods at a time
+  backoffLimit: 3             # retry 3 times before failure
+  activeDeadlineSeconds: 120  # max time for job to complete
+  template:
+    spec:
+      restartPolicy: Never    # Never or OnFailure (NOT Always)
+      containers:
+      - name: worker
+        image: busybox
+        command: ["sh", "-c", "echo processing && sleep 10"]
+EOF
+
+# --- CronJob: scheduled job ---
+kubectl create cronjob my-cron \
+  --image=busybox \
+  --schedule="*/5 * * * *" \
+  -- sh -c "echo running at $(date)"
+
+cat << 'EOF'
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: my-cron
+spec:
+  schedule: "0 2 * * *"            # 2am every day (cron syntax)
+  concurrencyPolicy: Forbid         # Allow, Forbid, Replace
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  startingDeadlineSeconds: 60       # if missed by 60s, skip
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: job
+            image: busybox
+            command: ["sh", "-c", "date; echo job done"]
+EOF
+
+# ===========================================================================
+# SECTION 3: STORAGE (10%)
+# ===========================================================================
+
+# ===========================================================================
+# 3A: STORAGE CLASSES & DYNAMIC PROVISIONING
+# ===========================================================================
+
+kubectl get storageclass                        # list storage classes
+kubectl get sc                                  # shorthand
+kubectl describe sc standard                    # details, provisioner, parameters
+
+cat << 'EOF'
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"  # set as default
+provisioner: kubernetes.io/aws-ebs             # provisioner plugin
+parameters:
+  type: gp3
+  iops: "3000"
+  encrypted: "true"
+reclaimPolicy: Delete                          # Delete or Retain
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer        # Immediate or WaitForFirstConsumer
+EOF
+
+# ===========================================================================
+# 3B: PERSISTENT VOLUMES & PERSISTENT VOLUME CLAIMS
+# ===========================================================================
+
+# PV access modes:
+# ReadWriteOnce (RWO)   — one node read/write
+# ReadOnlyMany (ROX)    — multiple nodes read only
+# ReadWriteMany (RWX)   — multiple nodes read/write
+# ReadWriteOncePod (RWOP) — single pod read/write (K8s 1.22+)
+
+# Reclaim policies:
+# Retain  — keep PV after PVC deleted (manual cleanup)
+# Delete  — auto-delete PV and underlying storage
+# Recycle — deprecated (basic scrub)
+
+# --- PersistentVolume (cluster-scoped) ---
+cat << 'EOF'
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: my-pv
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+  - ReadWriteOnce
+  reclaimPolicy: Retain
+  storageClassName: manual          # must match PVC storageClassName
+  hostPath:                         # local storage (for testing only)
+    path: /mnt/data
+  # For NFS:
+  # nfs:
+  #   server: 192.168.1.100
+  #   path: /exports/data
+EOF
+
+# --- PersistentVolumeClaim (namespace-scoped) ---
+cat << 'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-pvc
+  namespace: my-ns
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: fast-ssd        # "" = no class, manual binding
+  # For dynamic provisioning: omit storageClassName or use a defined class
+  # volumeName: my-pv               # bind to specific PV
+EOF
+
+# Check PVC status (Pending = no matching PV or provisioner)
+kubectl get pvc -n my-ns
+kubectl describe pvc my-pvc -n my-ns
+
+# --- Use PVC in a pod ---
+cat << 'EOF'
+spec:
+  volumes:
+  - name: data-volume
+    persistentVolumeClaim:
+      claimName: my-pvc             # reference the PVC
+  containers:
+  - name: app
+    image: nginx
+    volumeMounts:
+    - name: data-volume
+      mountPath: /data              # mount point inside container
+      readOnly: false
+EOF
+
+# --- Other volume types ---
+cat << 'EOF'
+spec:
+  volumes:
+  # emptyDir: temp storage, deleted when pod dies
+  - name: temp
+    emptyDir: {}
+  # emptyDir with memory backend (faster, uses RAM)
+  - name: ramdisk
+    emptyDir:
+      medium: Memory
+      sizeLimit: 256Mi
+
+  # hostPath: mounts from node filesystem (use carefully!)
+  - name: host-data
+    hostPath:
+      path: /var/log
+      type: Directory               # Directory, File, DirectoryOrCreate, FileOrCreate
+
+  # configMap as volume
+  - name: config
+    configMap:
+      name: my-config
+
+  # secret as volume
+  - name: creds
+    secret:
+      secretName: my-secret
+      defaultMode: 0400             # file permissions
+EOF
+
+# EXAM SCENARIO 8: Create PV and PVC
+# "Create a PersistentVolume 'task-pv' with 1Gi, RWO, hostPath /mnt/task.
+#  Create a PVC 'task-pvc' that binds to it. Mount it in a pod at /task"
+cat << 'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: task-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes: [ReadWriteOnce]
+  reclaimPolicy: Retain
+  storageClassName: manual
+  hostPath:
+    path: /mnt/task
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: task-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: manual
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: task-pod
+spec:
+  volumes:
+  - name: task-vol
+    persistentVolumeClaim:
+      claimName: task-pvc
+  containers:
+  - name: app
+    image: nginx
+    volumeMounts:
+    - name: task-vol
+      mountPath: /task
+EOF
+
+# ===========================================================================
+# SECTION 4: SERVICES & NETWORKING (20%)
+# ===========================================================================
+
+# ===========================================================================
+# 4A: SERVICES — ALL TYPES
+# ===========================================================================
+
+# Service types:
+# ClusterIP     — internal only (default)
+# NodePort      — exposes on each node at static port (30000-32767)
+# LoadBalancer  — external LB (cloud providers)
+# ExternalName  — DNS alias to external service
+
+# --- ClusterIP ---
+kubectl expose deployment my-app --port=80 --target-port=8080
+kubectl expose deployment my-app --port=80 --target-port=8080 --name=my-svc
+
+# --- NodePort ---
+kubectl expose deployment my-app \
+  --port=80 --target-port=8080 \
+  --type=NodePort \
+  --name=my-nodeport-svc
+
+# Service YAML
+cat << 'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-svc
+  namespace: my-ns
+spec:
+  type: ClusterIP               # ClusterIP, NodePort, LoadBalancer, ExternalName
+  selector:
+    app: my-app                 # matches pod labels
+  ports:
+  - protocol: TCP
+    port: 80                    # service port
+    targetPort: 8080            # pod port
+    # nodePort: 30080           # for NodePort (auto-assigned if omitted)
+  # For NodePort:
+  # type: NodePort
+  # For ExternalName:
+  # type: ExternalName
+  # externalName: my.external.service.com
+EOF
+
+# Check service endpoints (are pods selected correctly?)
+kubectl get endpoints my-svc
+kubectl get ep my-svc
+kubectl describe service my-svc               # shows selector and endpoints
+
+# Headless service (no ClusterIP, DNS returns pod IPs directly)
+cat << 'EOF'
+spec:
+  clusterIP: None               # headless
+  selector:
+    app: my-app
+  ports:
+  - port: 80
+EOF
+
+# ===========================================================================
+# 4B: NETWORK POLICIES
+# ===========================================================================
+
+# NetworkPolicy controls traffic between pods
+# Default: all traffic allowed (if no NetworkPolicy exists)
+# Once a NetworkPolicy selects a pod, it blocks all traffic not explicitly allowed
+
+# Deny all ingress to namespace
+cat << 'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-ingress
+  namespace: my-ns
+spec:
+  podSelector: {}               # {} = select ALL pods in namespace
+  policyTypes:
+  - Ingress                     # affect ingress traffic
+  # no ingress rules = deny all ingress
+EOF
+
+# Deny all egress from namespace
+cat << 'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-egress
+  namespace: my-ns
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  # no egress rules = deny all egress
+EOF
+
+# Allow specific ingress (most common pattern)
+cat << 'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: my-ns
+spec:
+  podSelector:
+    matchLabels:
+      app: backend              # this policy applies to backend pods
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend         # allow from frontend pods in SAME namespace
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring      # allow from monitoring namespace
+      podSelector:              # AND specific pods in that namespace
+        matchLabels:
+          app: prometheus
+    ports:
+    - protocol: TCP
+      port: 8080
+EOF
+
+# Allow egress to specific namespace
+cat << 'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-to-db
+  namespace: my-ns
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: database
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:                         # also allow DNS (or pods can't resolve names!)
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+EOF
+
+# EXAM SCENARIO 9: Network Policy
+# "Create a NetworkPolicy that allows pods with label 'role=frontend'
+#  to access pods with label 'role=backend' on port 3000 in namespace 'app'.
+#  Deny all other ingress to backend pods."
+cat << 'EOF' | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-policy
+  namespace: app
+spec:
+  podSelector:
+    matchLabels:
+      role: backend
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          role: frontend
+    ports:
+    - protocol: TCP
+      port: 3000
+EOF
+
+# ===========================================================================
+# 4C: INGRESS & GATEWAY API
+# ===========================================================================
+
+# Ingress: HTTP/HTTPS routing to services
+# Requires an Ingress controller (nginx-ingress, traefik, etc.)
+
+kubectl get ingress -A
+kubectl get ing
+kubectl describe ingress my-ing
+
+cat << 'EOF'
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  namespace: my-ns
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx           # which ingress controller to use
+  tls:
+  - hosts:
+    - myapp.example.com
+    secretName: my-tls-secret       # TLS secret
+  rules:
+  - host: myapp.example.com
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix            # Prefix, Exact, ImplementationSpecific
+        backend:
+          service:
+            name: api-svc
+            port:
+              number: 80
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-svc
+            port:
+              number: 80
+  - host: admin.example.com         # second host
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: admin-svc
+            port:
+              number: 80
+EOF
+
+# --- Gateway API (2025 exam addition — new standard) ---
+# More expressive than Ingress, role-oriented
+# Objects: GatewayClass, Gateway, HTTPRoute, TCPRoute, etc.
+
+kubectl get gatewayclasses                      # cluster-scoped gateway classes
+kubectl get gateways -A                         # gateways in all namespaces
+kubectl get httproutes -A                       # HTTP routes
+
+cat << 'EOF'
+# GatewayClass: defines the controller (like IngressClass)
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: nginx-gateway
+spec:
+  controllerName: gateway.nginx.org/nginx-gateway-controller
+---
+# Gateway: defines listener (like a load balancer)
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-gateway
+  namespace: my-ns
+spec:
+  gatewayClassName: nginx-gateway
+  listeners:
+  - name: http
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: Same              # Same, All, Selector
+  - name: https
+    port: 443
+    protocol: HTTPS
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - name: my-tls-secret
+---
+# HTTPRoute: routing rules (like Ingress rules)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: my-route
+  namespace: my-ns
+spec:
+  parentRefs:
+  - name: my-gateway            # attach to Gateway
+    namespace: my-ns
+  hostnames:
+  - "myapp.example.com"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api
+    backendRefs:
+    - name: api-svc
+      port: 80
+      weight: 100
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: frontend-svc
+      port: 80
+EOF
+
+# ===========================================================================
+# 4D: COREDNS
+# ===========================================================================
+
+# CoreDNS is the DNS server for Kubernetes (service discovery)
+# Runs as a deployment in kube-system namespace
+
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+kubectl get deployment coredns -n kube-system
+kubectl get configmap coredns -n kube-system -o yaml   # Corefile configuration
+
+# DNS naming convention:
+# <service>.<namespace>.svc.cluster.local
+# <pod-ip-dashes>.<namespace>.pod.cluster.local
+
+# Test DNS from inside a pod:
+kubectl run dns-test --image=busybox --restart=Never --rm -it -- \
+  nslookup kubernetes.default.svc.cluster.local
+kubectl run dns-test --image=busybox --restart=Never --rm -it -- \
+  nslookup my-svc.my-ns.svc.cluster.local
+
+# Check CoreDNS config
+kubectl get configmap coredns -n kube-system -o yaml
+
+# Common Corefile:
+cat << 'EOF'
+# Corefile (in CoreDNS configmap)
+.:53 {
+    errors
+    health {
+       lameduck 5s
+    }
+    ready
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+       pods insecure
+       fallthrough in-addr.arpa ip6.arpa
+       ttl 30
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf {        # forward non-cluster queries to upstream
+       max_concurrent 1000
+    }
+    cache 30
+    loop
+    reload
+    loadbalance
+}
+EOF
+
+# Troubleshoot CoreDNS
+kubectl logs -n kube-system -l k8s-app=kube-dns
+kubectl describe configmap coredns -n kube-system
+
+# ===========================================================================
+# SECTION 5: TROUBLESHOOTING (30%)
+# ===========================================================================
+
+# ===========================================================================
+# 5A: CLUSTER TROUBLESHOOTING
+# ===========================================================================
+
+# --- Check cluster component health ---
+kubectl get nodes                               # node status
+kubectl describe node <node>                    # conditions, events
+kubectl get componentstatuses                   # control plane components
+kubectl cluster-info
+
+# Check control plane pods (static pods)
+kubectl get pods -n kube-system
+kubectl logs -n kube-system kube-apiserver-<node>
+kubectl logs -n kube-system kube-controller-manager-<node>
+kubectl logs -n kube-system kube-scheduler-<node>
+kubectl logs -n kube-system etcd-<node>
+
+# Check kubelet (on node directly)
+systemctl status kubelet
+systemctl restart kubelet
+journalctl -u kubelet -f                        # follow kubelet logs
+journalctl -u kubelet --since "10 minutes ago"
+
+# Check kube-proxy
+kubectl get pods -n kube-system -l k8s-app=kube-proxy
+kubectl logs -n kube-system <kube-proxy-pod>
+
+# Check CNI
+kubectl get pods -n kube-system | grep -E "flannel|calico|cilium|weave"
+ls /etc/cni/net.d/
+
+# --- Node not ready ---
+kubectl describe node <node>                    # check Conditions and Events
+# Common causes:
+# 1. kubelet not running: systemctl start kubelet
+# 2. Network plugin not working: check CNI pods
+# 3. Disk pressure / memory pressure (shown in conditions)
+# 4. Node unreachable: check networking, firewall
+
+# On the node itself:
+systemctl status kubelet
+journalctl -u kubelet -n 50 --no-pager
+df -h                                           # disk usage
+free -m                                         # memory usage
+top                                             # CPU usage
+
+# --- API server not responding ---
+# Check if API server pod is running:
+ls /etc/kubernetes/manifests/kube-apiserver.yaml
+# If manifest corrupt:
+docker ps | grep apiserver                      # using docker
+crictl ps | grep apiserver                      # using containerd
+# Check logs:
+crictl logs <container-id>
+
+# ===========================================================================
+# 5B: POD TROUBLESHOOTING
+# ===========================================================================
+
+# --- Pod states and causes ---
+# Pending:
+#   - No nodes match scheduling constraints
+#   - Resource quota exceeded
+#   - PVC not bound
+# CrashLoopBackOff:
+#   - Application error (check logs)
+#   - Wrong command/args
+#   - Config issue (wrong env vars, missing configmap/secret)
+# ImagePullBackOff / ErrImagePull:
+#   - Wrong image name/tag
+#   - Private registry without imagePullSecrets
+#   - Registry unreachable
+# OOMKilled:
+#   - Memory limit exceeded
+# Error:
+#   - Non-zero exit code
+# Terminating (stuck):
+#   - Finalizer preventing deletion
+#   - Force delete needed
+
+# --- Debugging workflow ---
+kubectl get pods -n <ns>                        # 1. see state
+kubectl describe pod <pod> -n <ns>              # 2. events and conditions (most useful!)
+kubectl logs <pod> -n <ns>                      # 3. application logs
+kubectl logs <pod> -n <ns> -p                   # 4. previous container logs (after crash)
+kubectl exec -it <pod> -n <ns> -- sh            # 5. shell into container
+
+# For ImagePullBackOff:
+kubectl describe pod <pod> | grep -A5 "Events"
+# Fix: check image name, add imagePullSecret
+
+# For Pending:
+kubectl describe pod <pod> | grep -A10 "Events"
+kubectl get events --sort-by='.lastTimestamp' -n <ns>
+
+# For CrashLoopBackOff:
+kubectl logs <pod> -p                           # PREVIOUS container logs!
+kubectl describe pod <pod> | grep -A5 "Last State"
+
+# Debug with ephemeral container (distroless images)
+kubectl debug -it <pod> --image=busybox --target=<container>
+
+# Copy pod with debug image
+kubectl debug <pod> -it --copy-to=debug-pod --image=ubuntu
+
+# ===========================================================================
+# 5C: SERVICE & NETWORKING TROUBLESHOOTING
+# ===========================================================================
+
+# Service not routing traffic:
+kubectl get svc <svc> -n <ns>                   # check type, ports
+kubectl get endpoints <svc> -n <ns>             # are endpoints populated?
+kubectl describe svc <svc> -n <ns>              # check selector
+
+# If endpoints are empty: selector doesn't match any pods
+kubectl get pods -n <ns> --show-labels          # check pod labels
+kubectl get pods -n <ns> -l app=my-app          # test selector
+
+# Test service connectivity from a pod:
+kubectl run test --image=busybox --restart=Never --rm -it -- \
+  wget -qO- http://my-svc.my-ns.svc.cluster.local
+
+# Check DNS resolution:
+kubectl run test --image=busybox --restart=Never --rm -it -- \
+  nslookup my-svc.my-ns
+
+# Check kube-proxy (iptables rules)
+# On node:
+iptables -t nat -L KUBE-SERVICES | grep <svc-name>
+iptables -t nat -L | grep <cluster-ip>
+
+# Ingress not working:
+kubectl get ingress -n <ns>
+kubectl describe ingress <ing> -n <ns>          # check backend service, events
+kubectl get pods -n ingress-nginx               # is controller running?
+kubectl logs -n ingress-nginx <ingress-pod>     # controller logs
+
+# NetworkPolicy blocking traffic:
+kubectl get netpol -n <ns>
+kubectl describe netpol -n <ns>
+# Test without policy (temporarily delete it to see if traffic flows)
+
+# ===========================================================================
+# 5D: MONITORING & LOGGING
+# ===========================================================================
+
+# Resource usage
+kubectl top pods -A --sort-by=cpu
+kubectl top pods -A --sort-by=memory
+kubectl top nodes
+
+# Logs
+kubectl logs <pod>                              # current logs
+kubectl logs <pod> -f                           # follow
+kubectl logs <pod> -p                           # previous (crashed container)
+kubectl logs <pod> --since=1h
+kubectl logs <pod> --since=5m
+kubectl logs <pod> --tail=100
+kubectl logs <pod> --timestamps
+kubectl logs -l app=my-app -f --max-log-requests=10  # multi-pod
+
+# Container output streams:
+# stdout → kubectl logs
+# stderr → kubectl logs (both combined by default)
+
+# Events (often the first place to look)
+kubectl get events -n <ns> --sort-by='.lastTimestamp'
+kubectl get events -A --sort-by='.lastTimestamp'
+kubectl get events --field-selector=type=Warning
+kubectl get events --field-selector=involvedObject.name=<pod>
+
+# ===========================================================================
+# 5E: APPLICATION TROUBLESHOOTING SCENARIOS
+# ===========================================================================
+
+# EXAM SCENARIO 10: Fix a broken deployment
+# "Deployment 'web-app' has pods that won't start. Fix it."
+kubectl get deployment web-app
+kubectl describe deployment web-app             # check Events
+kubectl get pods -l app=web-app                 # check pod state
+kubectl describe pod <pod>                      # check Events (ImagePullBackOff, etc.)
+kubectl logs <pod>                              # application error
+# Common fixes:
+kubectl set image deployment/web-app nginx=nginx:1.25  # fix wrong image
+kubectl edit deployment web-app                         # fix env vars, resources, etc.
+
+# EXAM SCENARIO 11: Debug a service not accessible
+# "Service 'api-svc' is not accessible. Find and fix the issue."
+kubectl get svc api-svc
+kubectl get endpoints api-svc                   # empty? selector mismatch
+kubectl describe svc api-svc                    # check selector: app=api
+kubectl get pods --show-labels | grep api       # check actual pod labels
+# Fix: update service selector or pod labels
+kubectl patch svc api-svc -p '{"spec":{"selector":{"app":"api-v2"}}}'
+
+# EXAM SCENARIO 12: Node not ready
+# "Worker node 'node01' is NotReady. Fix it."
+kubectl describe node node01                    # check Conditions
+# SSH to node01:
+ssh node01
+systemctl status kubelet                        # is it running?
+systemctl start kubelet                         # if not
+systemctl enable kubelet                        # ensure starts on boot
+journalctl -u kubelet -n 50 --no-pager         # check errors
+
+# ===========================================================================
+# SECTION 6: EXAM-STYLE SCENARIOS — FULL TASKS
+# ===========================================================================
+
+# SCENARIO A: Multi-container pod with shared volume
+# "Create a pod 'shared-pod' with two containers:
+#  1. 'writer' (busybox) that writes date to /shared/data.txt every 5 seconds
+#  2. 'reader' (busybox) that reads from /shared/data.txt
+#  Use an emptyDir volume named 'shared-data'"
+cat << 'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shared-pod
+spec:
+  volumes:
+  - name: shared-data
+    emptyDir: {}
+  containers:
+  - name: writer
+    image: busybox
+    command: ["/bin/sh", "-c", "while true; do date >> /shared/data.txt; sleep 5; done"]
+    volumeMounts:
+    - name: shared-data
+      mountPath: /shared
+  - name: reader
+    image: busybox
+    command: ["/bin/sh", "-c", "tail -f /shared/data.txt"]
+    volumeMounts:
+    - name: shared-data
+      mountPath: /shared
+EOF
+
+# SCENARIO B: Init container
+# "Create a pod 'init-pod' with an init container 'setup' (busybox)
+#  that creates /data/ready.txt, and a main container 'app' (nginx)
+#  that starts after init completes. Mount /data as emptyDir."
+cat << 'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: init-pod
+spec:
+  volumes:
+  - name: data
+    emptyDir: {}
+  initContainers:
+  - name: setup
+    image: busybox
+    command: ["sh", "-c", "echo initialized > /data/ready.txt"]
+    volumeMounts:
+    - name: data
+      mountPath: /data
+  containers:
+  - name: app
+    image: nginx
+    volumeMounts:
+    - name: data
+      mountPath: /data
+EOF
+
+# SCENARIO C: Pod with resource limits and node selector
+cat << 'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: constrained-pod
+  namespace: my-ns
+spec:
+  nodeSelector:
+    disktype: ssd
+  containers:
+  - name: app
+    image: nginx:1.25
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+EOF
+
+# SCENARIO D: Expose deployment with specific service type
+# "Create deployment 'web' with image nginx, 2 replicas.
+#  Expose it as NodePort on port 30080"
+kubectl create deployment web --image=nginx --replicas=2
+kubectl expose deployment web \
+  --type=NodePort \
+  --port=80 \
+  --name=web-svc
+# Patch to set specific nodePort:
+kubectl patch svc web-svc \
+  --type='json' \
+  -p='[{"op":"replace","path":"/spec/ports/0/nodePort","value":30080}]'
+
+# SCENARIO E: Create and use a Secret as env var
+kubectl create secret generic api-creds \
+  --from-literal=API_KEY=abc123 \
+  --from-literal=API_SECRET=xyz789 \
+  -n my-ns
+
+cat << 'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secret-pod
+  namespace: my-ns
+spec:
+  containers:
+  - name: app
+    image: nginx
+    envFrom:
+    - secretRef:
+        name: api-creds
+EOF
+
+# SCENARIO F: Upgrade cluster from v1.29 to v1.30
+# (See Section 1B for full upgrade steps)
+kubeadm upgrade plan                            # check available versions
+apt-get install -y kubeadm=1.30.0-1.1
+kubeadm upgrade apply v1.30.0
+kubectl drain <node> --ignore-daemonsets
+apt-get install -y kubelet=1.30.0-1.1 kubectl=1.30.0-1.1
+systemctl daemon-reload && systemctl restart kubelet
+kubectl uncordon <node>
+
+# SCENARIO G: Create a ServiceAccount with token
+kubectl create serviceaccount my-sa -n my-ns
+
+# Create token (K8s 1.24+)
+kubectl create token my-sa -n my-ns --duration=24h
+
+# Create long-lived token (old style secret)
+cat << 'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-sa-token
+  namespace: my-ns
+  annotations:
+    kubernetes.io/service-account.name: my-sa
+type: kubernetes.io/service-account-token
+EOF
+
+kubectl get secret my-sa-token -n my-ns -o jsonpath='{.data.token}' | base64 -d
+
+# SCENARIO H: Fix failed CronJob
+kubectl get cronjob my-cron
+kubectl get jobs --selector=job-name=my-cron-<id>
+kubectl describe job <failed-job>
+kubectl logs <failed-pod>
+# Check: schedule syntax, image, command, restart policy
+
+# ===========================================================================
+# SECTION 7: KUBECONFIG & CERTIFICATE MANAGEMENT
+# ===========================================================================
+
+# --- Create kubeconfig for a user ---
+# Step 1: Create private key
+openssl genrsa -out alice.key 2048
+
+# Step 2: Create CSR
+openssl req -new -key alice.key -out alice.csr \
+  -subj "/CN=alice/O=dev-team"            # CN=username, O=group
+
+# Step 3: Create Kubernetes CertificateSigningRequest
+cat << 'EOF' | kubectl apply -f -
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: alice-csr
+spec:
+  request: $(cat alice.csr | base64 | tr -d '\n')
+  signerName: kubernetes.io/kube-apiserver-client
+  usages:
+  - client auth
+EOF
+
+# Step 4: Approve CSR
+kubectl certificate approve alice-csr
+kubectl get csr alice-csr                   # should be Approved,Issued
+
+# Step 5: Get certificate
+kubectl get csr alice-csr -o jsonpath='{.status.certificate}' | base64 -d > alice.crt
+
+# Step 6: Create kubeconfig
+kubectl config set-cluster my-cluster \
+  --certificate-authority=/etc/kubernetes/pki/ca.crt \
+  --server=https://<api-server>:6443 \
+  --kubeconfig=alice.kubeconfig
+
+kubectl config set-credentials alice \
+  --client-certificate=alice.crt \
+  --client-key=alice.key \
+  --kubeconfig=alice.kubeconfig
+
+kubectl config set-context alice@my-cluster \
+  --cluster=my-cluster \
+  --user=alice \
+  --namespace=my-ns \
+  --kubeconfig=alice.kubeconfig
+
+kubectl config use-context alice@my-cluster --kubeconfig=alice.kubeconfig
+
+# --- Check certificate expiry ---
+# Control plane certificates (typically 1 year):
+kubeadm certs check-expiration
+# Or manually:
+openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -dates
+
+# Renew certificates
+kubeadm certs renew all                     # renew all control plane certs
+kubeadm certs renew apiserver               # renew specific cert
+
+# ===========================================================================
+# SECTION 8: STATEFULSETS
+# ===========================================================================
+
+# StatefulSet: ordered, sticky identity for pods
+# Use for: databases, distributed systems needing stable network identity
+
+cat << 'EOF'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: my-db
+spec:
+  serviceName: "my-db"                      # headless service name (required)
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-db
+  template:
+    metadata:
+      labels:
+        app: my-db
+    spec:
+      containers:
+      - name: db
+        image: postgres:15
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:                     # creates PVC per pod
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi
+---
+# Required headless service for StatefulSet DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-db
+spec:
+  clusterIP: None                           # headless
+  selector:
+    app: my-db
+  ports:
+  - port: 5432
+EOF
+
+# StatefulSet pod naming: <name>-0, <name>-1, <name>-2
+# DNS: <pod>.<service>.<namespace>.svc.cluster.local
+# Example: my-db-0.my-db.default.svc.cluster.local
+
+# ===========================================================================
+# SECTION 9: IMPORTANT YAML PATTERNS
+# ===========================================================================
+
+# --- Generate any YAML quickly with dry-run ---
+kubectl run my-pod --image=nginx $do                         # pod
+kubectl create deployment my-dep --image=nginx $do          # deployment
+kubectl create service clusterip my-svc --tcp=80:8080 $do  # service
+kubectl create configmap my-cm --from-literal=k=v $do      # configmap
+kubectl create secret generic my-sec --from-literal=k=v $do # secret
+kubectl create job my-job --image=busybox $do -- sh -c "echo hi"  # job
+kubectl create cronjob my-cron --image=busybox --schedule="*/5 * * * *" $do -- sh -c "date"
+kubectl create role my-role --verb=get,list --resource=pods $do  # role
+kubectl create rolebinding my-rb --role=my-role --user=alice $do  # rolebinding
+
+# --- kubectl explain: find field names ---
+kubectl explain pod.spec
+kubectl explain pod.spec.containers
+kubectl explain pod.spec.containers.resources
+kubectl explain pod.spec.affinity.nodeAffinity
+kubectl explain deployment.spec.strategy
+kubectl explain networkpolicy.spec.ingress
+
+# --- Complete Pod template reference ---
+cat << 'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: complete-pod
+  namespace: default
+  labels:
+    app: my-app
+    version: v1
+  annotations:
+    description: "example pod"
+spec:
+  serviceAccountName: my-sa
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 30
+  restartPolicy: Always                     # Always, OnFailure, Never
+  dnsPolicy: ClusterFirst                   # ClusterFirst, Default, None
+  hostNetwork: false
+  hostPID: false
+  securityContext:                          # pod-level security
+    runAsUser: 1000
+    runAsGroup: 3000
+    fsGroup: 2000
+    runAsNonRoot: true
+  initContainers:
+  - name: init
+    image: busybox
+    command: ["sh", "-c", "echo init done"]
+  containers:
+  - name: app
+    image: nginx:1.25
+    imagePullPolicy: IfNotPresent           # Always, Never, IfNotPresent
+    command: ["/bin/sh"]
+    args: ["-c", "nginx -g 'daemon off;'"]
+    workingDir: /app
+    ports:
+    - name: http
+      containerPort: 80
+      protocol: TCP
+    env:
+    - name: MY_VAR
+      value: "hello"
+    - name: FROM_FIELD
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name          # pod name as env var
+    - name: FROM_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: my-secret
+          key: password
+    envFrom:
+    - configMapRef:
+        name: my-config
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    securityContext:                        # container-level security
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+        add: ["NET_BIND_SERVICE"]
+    livenessProbe:
+      httpGet:
+        path: /healthz
+        port: 8080
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      failureThreshold: 3
+    readinessProbe:
+      tcpSocket:
+        port: 8080
+      initialDelaySeconds: 5
+      periodSeconds: 5
+    startupProbe:
+      httpGet:
+        path: /startup
+        port: 8080
+      failureThreshold: 30
+      periodSeconds: 10
+    volumeMounts:
+    - name: data
+      mountPath: /data
+      readOnly: false
+    - name: config
+      mountPath: /etc/config
+      readOnly: true
+  volumes:
+  - name: data
+    emptyDir: {}
+  - name: config
+    configMap:
+      name: my-config
+  nodeSelector:
+    disktype: ssd
+  tolerations:
+  - key: "special"
+    operator: "Exists"
+    effect: "NoSchedule"
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: zone
+            operator: In
+            values: [us-east-1a]
+  imagePullSecrets:
+  - name: registry-secret
+EOF
+
+# ===========================================================================
+# SECTION 10: EXAM TIPS & TIME MANAGEMENT
+# ===========================================================================
+
+# --- Before the exam ---
+# Practice on killer.sh simulator (comes with exam purchase — use it!)
+# Know kubernetes.io/docs structure:
+#   Concepts, Tasks, Reference
+#   Use search, not navigation
+#   Bookmark: tasks/administer-cluster, tasks/configure-pod-container
+
+# --- During the exam ---
+# Read each question FULLY before typing anything
+# Copy the context switch command directly from the question
+# Check namespace: many tasks specify a namespace
+# Use $do alias for every YAML generation: kubectl create ... $do > file.yaml
+# Edit the file, then: kubectl apply -f file.yaml (easier than piping)
+# Verify your work after each task: kubectl get <resource>, kubectl describe
+
+# --- Context switching (MUST do before every task) ---
+kubectl config use-context <given-context>
+kubectl config set-context --current --namespace=<given-namespace>
+
+# --- Speed tricks ---
+# Use dry-run + edit pattern:
+kubectl create deployment web --image=nginx --replicas=3 $do > dep.yaml
+vim dep.yaml                                # add nodeSelector, resources, etc.
+kubectl apply -f dep.yaml
+
+# Use kubectl explain in the exam (no internet search needed):
+kubectl explain pod.spec.containers.livenessProbe
+kubectl explain deployment.spec.strategy.rollingUpdate
+
+# Use --force --grace-period=0 for stuck resources:
+kubectl delete pod stuck-pod --force --grace-period=0
+
+# Verify commands:
+kubectl get pods -w                         # watch creation
+kubectl rollout status deployment/web       # watch rollout
+kubectl wait --for=condition=ready pod -l app=web --timeout=60s
+
+# --- Point allocation strategy ---
+# Each task shows its point value — attempt high-value tasks first
+# A partially correct solution may still get partial credit
+# Skip and come back: mark questions you skip in the exam UI
+# Simple tasks (get a value, create a basic pod) should take < 2 minutes
+# Hard tasks (etcd restore, cluster upgrade) need 10-15 minutes
+
+# --- Common mistakes to avoid ---
+# Forgetting to switch context (failing on wrong cluster)
+# Wrong namespace (always check the task's namespace)
+# Not verifying after creation (typos in image names etc.)
+# Wasting time on hard questions (move on, come back)
+# Not using dry-run first on complex resources
+# Forgetting restartPolicy: Never for Pods and Jobs (not deployments)
+
+# ===========================================================================
+# QUICK REFERENCE CHEATSHEET
+# ===========================================================================
+
+# EXAM START:
+#   alias k=kubectl; export do='--dry-run=client -o yaml'
+#   source <(kubectl completion bash); complete -F __start_kubectl k
+#   kubectl config use-context <ctx>   # do this before EVERY task
+
+# RBAC:
+#   kubectl create role R --verb=get,list --resource=pods -n NS
+#   kubectl create rolebinding RB --role=R --user=U -n NS
+#   kubectl create rolebinding RB --role=R --serviceaccount=NS:SA -n NS
+#   kubectl create clusterrole CR --verb='*' --resource=pods
+#   kubectl create clusterrolebinding CRB --clusterrole=CR --user=U
+#   kubectl auth can-i get pods --as=U -n NS
+
+# KUBEADM:
+#   kubeadm upgrade plan
+#   kubeadm upgrade apply v1.30.0
+#   kubeadm certs check-expiration
+#   kubeadm certs renew all
+
+# ETCD:
+#   ETCDCTL_API=3 etcdctl snapshot save /path/backup.db \
+#     --endpoints=https://127.0.0.1:2379 \
+#     --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+#     --cert=/etc/kubernetes/pki/etcd/server.crt \
+#     --key=/etc/kubernetes/pki/etcd/server.key
+
+# PODS & WORKLOADS:
+#   kubectl run P --image=IMG $do > pod.yaml
+#   kubectl create deploy D --image=IMG --replicas=N $do > dep.yaml
+#   kubectl set image deploy/D C=IMG:TAG
+#   kubectl rollout undo deploy/D
+#   kubectl rollout status deploy/D
+#   kubectl scale deploy D --replicas=N
+#   kubectl autoscale deploy D --min=2 --max=10 --cpu-percent=80
+
+# SCHEDULING:
+#   nodeSelector: {disktype: ssd}
+#   kubectl taint node N key=val:NoSchedule
+#   kubectl taint node N key:NoSchedule-       # remove
+#   kubectl drain N --ignore-daemonsets --delete-emptydir-data
+#   kubectl cordon N / kubectl uncordon N
+
+# STORAGE:
+#   kubectl get pv,pvc -A
+#   kubectl describe pvc P                     # check if Bound
+
+# SERVICES & NETWORKING:
+#   kubectl expose deploy D --port=80 --target-port=8080
+#   kubectl expose deploy D --type=NodePort --port=80
+#   kubectl get endpoints SVC
+#   kubectl get netpol -A
+
+# LOGS & DEBUG:
+#   kubectl logs P -f --since=1h
+#   kubectl logs P -p                          # previous container
+#   kubectl describe pod P                     # events!
+#   kubectl get events --sort-by='.lastTimestamp'
+#   kubectl debug -it P --image=busybox --target=C
+#   kubectl top pods -A --sort-by=cpu
+
+# NODES:
+#   kubectl get nodes -o wide
+#   systemctl status kubelet   (on node)
+#   journalctl -u kubelet -f   (on node)
+
+# GENERATE YAML:
+#   k run P --image=IMG $do
+#   k create deploy D --image=IMG $do
+#   k create svc clusterip S --tcp=80:8080 $do
+#   k create cm C --from-literal=k=v $do
+#   k create secret generic S --from-literal=k=v $do
+#   k create job J --image=IMG $do -- CMD
+#   k create cronjob CJ --image=IMG --schedule="*/5 * * * *" $do
+#   k create role R --verb=get,list --resource=pods $do
+#   k create rolebinding RB --role=R --user=U $do
+
+# =============================================================================
+# END OF CKA REFERENCE
+# =============================================================================
+```
+
+---
+
+### Domains covered (overview)
+
+#### Cluster Architecture, Installation & Configuration (25%)
+
+- **RBAC**: Roles, ClusterRoles, RoleBindings/ClusterRoleBindings, `kubectl auth can-i`.
+- **kubeadm**: `init`, `join`, full **upgrade workflow**, token management.
+- **etcd**: snapshot backup and restore with correct certs and data dirs.
+- **Helm & Kustomize**: install/upgrade/rollback, templating, repo management, `kustomization.yaml`.
+- **CRDs & Operators**: inspect CRDs, interact with custom resources, install operators via Helm.
+- **Extension interfaces**: CNI, CSI, CRI — what they are and how to inspect them.
+- **Certificates & kubeconfig**: CSR, approve, create user kubeconfig, renew control‑plane certs.
+- **Static pods & HA concepts**.
+
+#### Workloads & Scheduling (15%)
+
+- **Deployments**: rolling updates, rollback, pause/resume, history, scaling.
+- **ConfigMaps & Secrets**: create, consume via env/envFrom/volumes.
+- **Autoscaling**: HPA (and awareness of VPA).
+- **Scheduling controls**: `nodeSelector`, node/pod affinity and anti‑affinity, taints/tolerations.
+- **Resources & quotas**: requests/limits, `LimitRange`, `ResourceQuota`, `PriorityClass`.
+- **Workload types**: Pods, Deployments, DaemonSets, Jobs, CronJobs, Init containers, multi‑container pods, StatefulSets, static pods.
+
+#### Storage (10%)
+
+- **StorageClasses** and dynamic provisioning.
+- **PVs/PVCs**: access modes, reclaim policies, binding and phases.
+- **Volume types**: `emptyDir`, `hostPath`, `configMap`, `secret`, PVC, memory‑backed volumes.
+
+#### Services & Networking (20%)
+
+- **Service types**: ClusterIP, NodePort, LoadBalancer, ExternalName, headless.
+- **Endpoints** and endpoint debugging.
+- **NetworkPolicies**: ingress/egress, deny‑all and allow‑specific patterns, DNS egress.
+- **Ingress**: rules, TLS, `pathType`, `ingressClassName`.
+- **Gateway API**: `GatewayClass`, `Gateway`, `HTTPRoute` basics.
+- **CoreDNS**: config, DNS naming, troubleshooting and testing from pods.
+
+#### Troubleshooting (30%)
+
+- **Cluster components**: nodes, control plane pods, kubelet, CNI, kube‑proxy.
+- **Pod lifecycle issues**: Pending, CrashLoopBackOff, ImagePullBackOff, OOMKilled, stuck terminating.
+- **Service & networking**: selectors, endpoints, DNS, Ingress, NetworkPolicy.
+- **Observability**: `kubectl top`, logs, events, `kubectl debug`, ephemeral containers.
+- **Node‑level debugging**: `systemctl`, `journalctl`, resource pressure analysis.
+
+#### Exam technique & workflow
+
+- **Context handling**: switch context/namespace for every task.
+- **Aliases & completion**: speed up `kubectl` usage.
+- **Dry‑run + edit**: generate YAML, edit, then `kubectl apply -f`.
+- **`kubectl explain`**: use instead of web searching for field details.
+- **Time management**: prioritize high‑value tasks, skip and return, accept partial credit.

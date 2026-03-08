@@ -1,0 +1,2140 @@
+---
+sidebarTitle: System Boot
+---
+
+# From Power Button to Prompt: A Complete Guide to System Boot and Container Startup
+
+---
+
+## Table of Contents
+
+### Part 1 — Normal Host Boot (Bare Metal or VM)
+
+1. [Foundational Concepts](#foundational-concepts)
+2. [Stage 0: Electrical Power-On](#stage-0-electrical-power-on)
+3. [Stage 1: Firmware (BIOS / UEFI)](#stage-1-firmware-bios--uefi)
+4. [Stage 2: Bootloader](#stage-2-bootloader)
+5. [Stage 3: Kernel Early Boot](#stage-3-kernel-early-boot)
+6. [Stage 4: initramfs — The Temporary Root](#stage-4-initramfs--the-temporary-root)
+7. [Stage 5: The Real Root Filesystem](#stage-5-the-real-root-filesystem)
+8. [Stage 6: PID 1 — The First Process](#stage-6-pid-1--the-first-process)
+9. [Stage 7: Service Initialization](#stage-7-service-initialization)
+10. [Stage 8: Multi-User State and Login](#stage-8-multi-user-state-and-login)
+
+### Part 2 — Container Initialization
+
+11. [What a Container Is (And Is Not)](#what-a-container-is-and-is-not)
+12. [What the Host Kernel Already Provides](#what-the-host-kernel-already-provides)
+13. [What a Container Skips Entirely](#what-a-container-skips-entirely)
+14. [Namespaces — Isolation Boundaries](#namespaces--isolation-boundaries)
+15. [cgroups — Resource Control](#cgroups--resource-control)
+16. [The Container Root Filesystem](#the-container-root-filesystem)
+17. [PID 1 Inside a Container](#pid-1-inside-a-container)
+18. [Virtual Filesystems in Containers](#virtual-filesystems-in-containers)
+19. [Container Networking](#container-networking)
+20. [Container Storage](#container-storage)
+21. [Why Containers Start Instantly](#why-containers-start-instantly)
+
+### Comparison and Summary
+
+22. [Host Boot vs Container Start — Full Comparison Table](#host-boot-vs-container-start--full-comparison-table)
+23. [Unified Mental Model](#unified-mental-model)
+
+---
+
+## Foundational Concepts
+
+Before diving into the boot sequence, you need to understand a few terms that will appear throughout this document.
+
+**Kernel**: The kernel is the core program of an operating system. It is the first real software that runs after the machine's firmware hands over control, and it stays running for the entire lifetime of the system. The kernel's job is to manage hardware (CPU, RAM, disks, network cards) and provide a controlled interface so that other programs can use that hardware without conflicting with each other. When people say "Linux," they technically mean the kernel. Everything else — your shell, your files, your applications — runs on top of it.
+
+**Filesystem**: A filesystem is a method of organizing data on a storage device (hard drive, SSD, USB stick) so that the operating system can find, read, write, and delete files. Think of it like a library's catalog system: the physical books (data) exist on shelves (disk sectors), but the catalog (filesystem) tells you which shelf and position each book is at. Common Linux filesystems include ext4, XFS, and Btrfs. A filesystem must be **mounted** — attached to a directory in the tree — before its contents are accessible.
+
+**Process**: A process is a running instance of a program. When you type `ls` in a terminal, the operating system creates a process, loads the `ls` program's code into memory, and lets the CPU execute it. Every process gets a unique number called a **PID** (Process ID). The very first process the kernel creates gets PID 1, and every other process on the system is a descendant of it.
+
+**Namespace**: A namespace is a Linux kernel feature that creates an isolated view of a system resource. Imagine having two rooms with identical furniture arrangements — people in each room think they have the entire house to themselves, but they are actually in separate rooms of the same house. Namespaces do this for things like process IDs, network interfaces, and mount points. This is the foundation of containers.
+
+**RAM (Random Access Memory)**: The fast, volatile memory where the CPU does its active work. "Volatile" means everything in RAM disappears when power is lost. The CPU cannot execute programs directly from a hard drive — the program's code and data must first be loaded into RAM.
+
+**Firmware**: Software that is permanently stored on a chip on the motherboard. It runs before any operating system and is responsible for the very first steps of bringing the hardware to life.
+
+---
+
+## Part 1 — Normal Host Boot
+
+## Stage 0: Electrical Power-On
+
+### What physically happens
+
+When you press the power button on a computer, you complete an electrical circuit. Here is the precise chain of events:
+
+**Step 1 — The PSU wakes up.**
+The power button sends a signal to the **PSU (Power Supply Unit)**. The PSU converts AC power from the wall outlet (110V or 220V) into several DC voltage rails that components need:
+
+| Rail     | Purpose                                          |
+|----------|--------------------------------------------------|
+| +3.3V    | RAM modules, some chipset logic                  |
+| +5V      | USB ports, SATA logic, fans                      |
+| +12V     | CPU (via voltage regulators), GPU, drives motors |
+| +5V SB   | Standby power — always on when plugged in        |
+
+The PSU does not instantly deliver power. It goes through an internal self-test (~100–500 milliseconds) to ensure all voltage rails are stable. Once stable, it asserts a signal called **Power Good** (sometimes called `PWR_OK`) on a dedicated pin going to the motherboard.
+
+**Step 2 — The chipset releases the CPU reset.**
+While the PSU was off, the motherboard chipset held the CPU in a **reset state** — think of it like holding someone's hand down so they can't move. The CPU's `RESET#` pin was held low (active). When the chipset sees the Power Good signal, it releases the reset pin, allowing the CPU to begin executing.
+
+**Step 3 — The CPU begins at the Reset Vector.**
+Every x86 CPU, upon release from reset, begins execution at a hardcoded memory address called the **reset vector**. On x86-64 machines, this address is `0xFFFFFFF0` (16 bytes below the 4 GB mark in the physical address space). At this point, the CPU is in **real mode** — a legacy 16-bit execution mode inherited from the 1978 Intel 8086. In real mode, the CPU can only address ~1 MB of memory and has no memory protection.
+
+But wait — RAM is not initialized yet. How can the CPU execute anything from memory?
+
+The motherboard's chipset maps the firmware ROM chip (a flash memory chip soldered onto the motherboard or socketed) to that address range. So when the CPU fetches its first instruction from `0xFFFFFFF0`, it is actually reading from the firmware chip, not from RAM.
+
+```
+Physical Address Space at Power-On
+┌──────────────────────────────┐ 0xFFFFFFFF (4 GB)
+│   Firmware ROM mapped here   │ ← CPU starts executing at 0xFFFFFFF0
+│   (flash chip on mobo)       │
+├──────────────────────────────┤ 0xFFFF0000 (~64 KB below 4 GB)
+│                              │
+│   (unmapped / unused)        │
+│                              │
+├──────────────────────────────┤
+│   (unmapped / unused)        │
+├──────────────────────────────┤ 0x00100000 (1 MB)
+│   Legacy area                │
+│   (video BIOS, option ROMs)  │
+├──────────────────────────────┤ 0x00000000
+│   Real mode IVT / BDA        │ ← Interrupt Vector Table (used by BIOS)
+└──────────────────────────────┘
+```
+
+The first instruction at the reset vector is almost always a **JMP (jump)** — it redirects execution to the beginning of the firmware's actual initialization code elsewhere in the ROM.
+
+### What memory contains at this point
+
+- **RAM**: Uninitialized garbage. Cannot be used yet.
+- **CPU caches**: Empty.
+- **Firmware ROM**: Contains the BIOS/UEFI code, mapped into the address space by the chipset.
+
+### What processes exist
+
+None. The concept of a "process" does not exist yet. There is no operating system. The CPU is simply fetching and executing raw machine code instructions from the firmware ROM, one after another.
+
+### What would break if this stage fails
+
+- **PSU failure**: No power → nothing happens. No fans, no lights.
+- **Power Good never asserts**: CPU stays in reset indefinitely. The machine appears dead.
+- **Firmware chip corrupted or missing**: CPU jumps to the reset vector but finds invalid instructions. The machine hangs immediately with no display output. Some motherboards have a backup firmware chip for exactly this scenario.
+
+---
+
+## Stage 1: Firmware (BIOS / UEFI)
+
+The firmware is the first real software that runs. Its job is to bring the raw hardware to a usable state and find an operating system to hand control to. There are two firmware standards in the PC world: the legacy **BIOS** and the modern **UEFI**.
+
+### BIOS (Basic Input/Output System) — The Legacy Path
+
+BIOS dates back to the original IBM PC in 1981. It operates entirely in 16-bit real mode and follows a simple, rigid boot process:
+
+**1. POST (Power-On Self-Test)**
+The BIOS performs a series of hardware checks:
+- Tests CPU registers and basic arithmetic
+- Checks the first 64 KB of RAM (before full RAM training)
+- Initializes the interrupt controller (PIC/APIC)
+- Initializes basic video output (so you can see POST codes or errors)
+- Enumerates PCI/PCIe devices
+
+If a critical error is found, the BIOS communicates it through **beep codes** (a pattern of short and long beeps through the motherboard speaker) since the display might not be working yet.
+
+**2. RAM Training (Memory Initialization)**
+This is one of the most complex and time-consuming parts of early boot. Modern DDR4/DDR5 RAM does not simply "work" when power is applied. The memory controller (on the CPU in modern systems) must:
+
+- Detect how many DIMMs are installed and read their **SPD (Serial Presence Detect)** data — a small EEPROM on each RAM stick that describes its size, speed, timings, and voltage requirements
+- Calibrate signal timing for each memory channel (signals travel at nanosecond precision; getting the timing wrong by a fraction of a nanosecond corrupts data)
+- Train read/write leveling — adjusting the phase of data signals so all bytes in a 64-bit word arrive at the CPU simultaneously
+- Test the memory to verify it works at the configured speed
+- This process can take 1–5 seconds and is why you sometimes see "memory training" on first boot after changing RAM
+
+**3. Hardware Enumeration**
+The BIOS walks the **PCI Express** bus, discovering all connected devices (GPU, NIC, SATA controller, NVMe drives, USB controllers). Each device is assigned address ranges and interrupt lines so the CPU can communicate with it.
+
+**4. Finding a Bootloader**
+BIOS boot uses **MBR (Master Boot Record)**, which we will discuss in Stage 2. The BIOS iterates through a configured boot order (e.g., first USB, then SSD, then network) and reads the first 512 bytes (one sector) of each device, looking for the magic signature `0x55AA` at bytes 510–511.
+
+### UEFI (Unified Extensible Firmware Interface) — The Modern Path
+
+UEFI replaces BIOS with a far more capable firmware environment. It was developed by Intel starting in the mid-1990s and standardized by the UEFI Forum.
+
+Key differences from BIOS:
+
+| Feature | BIOS | UEFI |
+|---------|------|------|
+| CPU mode | 16-bit real mode | 32-bit or 64-bit protected/long mode |
+| Max boot disk size | 2.2 TB (MBR limit) | 9.4 ZB (GPT, effectively unlimited) |
+| Boot method | Load 512-byte MBR sector | Load EFI application from FAT32 partition |
+| User interface | Text-based, crude | Graphical, mouse-supported |
+| Driver model | BIOS interrupts (INT 13h) | Portable EFI driver binaries |
+| Secure Boot | Not supported | Supported (cryptographic chain of trust) |
+| Boot entries | Ordered disk list | Named boot entries stored in NVRAM |
+
+**UEFI Boot Flow:**
+
+1. **SEC (Security Phase)** — The CPU executes from the reset vector. Minimal platform initialization. On UEFI, the firmware is structured as a series of phases defined by the **PI (Platform Initialization) specification**.
+
+2. **PEI (Pre-EFI Initialization)** — RAM training happens here. Before RAM is available, the PEI phase uses CPU cache as temporary RAM (a technique called **Cache-as-RAM** or CAR). Once RAM is trained, execution can use real memory.
+
+3. **DXE (Driver Execution Environment)** — The bulk of UEFI firmware runs here. UEFI loads drivers for storage, networking, USB, GPU, and more. These drivers are **EFI binaries** stored in the firmware flash chip.
+
+4. **BDS (Boot Device Selection)** — UEFI reads boot entries from **NVRAM** (non-volatile RAM on the motherboard). Each entry specifies a disk partition and a path to an EFI executable (e.g., `\EFI\ubuntu\shimx64.efi`). The firmware loads this executable from the **EFI System Partition (ESP)** — a FAT32-formatted partition on the disk.
+
+```
+UEFI Boot Phases
+┌──────────────────────────────────────────────────────────────────┐
+│ SEC  │ PEI          │ DXE               │ BDS        │ OS       │
+│      │              │                   │            │          │
+│ CPU  │ Cache-as-RAM │ Full drivers      │ Find boot  │ Hand off │
+│ init │ → RAM train  │ USB, NVMe, Net... │ entry      │ to OS    │
+│      │ → real RAM   │                   │ Load .efi  │          │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Secure Boot (UEFI only)
+
+Secure Boot is an optional UEFI feature that verifies the cryptographic signature of every piece of code loaded during boot. The firmware contains a database of trusted signing keys (typically Microsoft's key and optionally others). Before executing a bootloader, UEFI checks that it was signed by a trusted key. If the signature is invalid or missing, UEFI refuses to load it. This prevents **bootkits** — malware that infects the boot process before the operating system's security measures activate.
+
+Most Linux distributions handle Secure Boot through a small program called **shim** — a first-stage bootloader signed with Microsoft's key that then loads GRUB (the real bootloader), which is signed with the distribution's own key.
+
+### What memory contains at this point
+
+- **RAM**: Fully initialized and tested. Firmware data structures occupy some of it.
+- **Firmware**: Still running. UEFI has loaded numerous drivers into RAM.
+- **CPU**: Running in real mode (BIOS) or 64-bit long mode (UEFI).
+
+### What filesystems are mounted
+
+- **BIOS**: No filesystem concept. BIOS reads raw disk sectors.
+- **UEFI**: The firmware has a FAT32 driver and can read the EFI System Partition directly.
+
+### What processes exist
+
+Still none. Firmware is not an operating system — it does not have a process model. There is a single thread of execution on the bootstrap processor (BSP), the first CPU core.
+
+### What would break if this stage fails
+
+- **RAM training failure**: Machine beeps or shows an error code. Cannot proceed — everything needs RAM.
+- **No bootable device found**: BIOS/UEFI shows "No bootable device" or "Boot device not found." The firmware has done its job, but there is no OS to hand off to.
+- **Secure Boot rejection**: "Security violation" error. The bootloader's signature is not trusted. The machine refuses to boot the OS.
+- **Corrupted firmware drivers**: Storage controller not detected → cannot read disks → no boot.
+
+---
+
+## Stage 2: Bootloader
+
+The bootloader is a small but critical program that bridges the gap between firmware and the operating system kernel. Its job is to load the kernel image and an initial filesystem (initramfs) into RAM, configure them correctly, and transfer CPU control to the kernel.
+
+### Disk Layouts: MBR vs GPT
+
+Before the bootloader can load anything, it must understand how the disk is organized.
+
+**MBR (Master Boot Record)** — Used with BIOS
+
+The MBR occupies the first 512 bytes (one sector) of a disk:
+
+```
+MBR Layout (512 bytes)
+┌─────────────────────────────────────────┐
+│ Bootstrap Code (446 bytes)              │ ← Tiny bootloader first stage
+├─────────────────────────────────────────┤
+│ Partition Table (64 bytes)              │ ← 4 entries × 16 bytes each
+│  ┌──────────────────────────────────┐   │
+│  │ Partition 1: start, size, type  │   │
+│  │ Partition 2: start, size, type  │   │
+│  │ Partition 3: start, size, type  │   │
+│  │ Partition 4: start, size, type  │   │
+│  └──────────────────────────────────┘   │
+├─────────────────────────────────────────┤
+│ Magic Signature: 0x55AA (2 bytes)       │ ← BIOS checks for this
+└─────────────────────────────────────────┘
+```
+
+Limitations:
+- Maximum 4 primary partitions (workaround: one can be an "extended" partition containing logical partitions)
+- Maximum disk size: 2.2 TB (because sector addresses are 32-bit, and 2^32 × 512 bytes = 2.2 TB)
+- Bootstrap code is only 446 bytes — not enough for a real bootloader, so it acts as a **first stage** that loads a larger second stage from elsewhere on disk
+
+**GPT (GUID Partition Table)** — Used with UEFI
+
+GPT is part of the UEFI specification and solves MBR's limitations:
+
+```
+GPT Disk Layout
+┌──────────────────────────────────────────┐
+│ Protective MBR (LBA 0)                  │ ← So old tools don't overwrite GPT
+├──────────────────────────────────────────┤
+│ GPT Header (LBA 1)                      │ ← Disk GUID, partition count, CRC32
+├──────────────────────────────────────────┤
+│ Partition Entry Array (LBA 2–33)         │ ← 128 entries × 128 bytes each
+│  ┌──────────────────────────────────┐    │
+│  │ Part 1: EFI System Partition     │    │
+│  │ Part 2: Linux root (/)           │    │
+│  │ Part 3: Linux swap               │    │
+│  │ Part 4: Linux home (/home)       │    │
+│  │ ...up to 128 partitions...       │    │
+│  └──────────────────────────────────┘    │
+├──────────────────────────────────────────┤
+│ Actual Partition Data                    │
+│  ┌────────────────────────────────────┐  │
+│  │ ESP (FAT32, ~512 MB)              │  │
+│  │ Root (ext4/XFS/Btrfs, main OS)    │  │
+│  │ Swap                              │  │
+│  │ Home                              │  │
+│  └────────────────────────────────────┘  │
+├──────────────────────────────────────────┤
+│ Backup Partition Entry Array             │ ← Redundant copy
+├──────────────────────────────────────────┤
+│ Backup GPT Header (last LBA)            │ ← Redundant copy
+└──────────────────────────────────────────┘
+```
+
+GPT uses 64-bit LBA addresses, supporting disks up to **9.4 ZB (zettabytes)**. Each partition is identified by a **GUID** (a 128-bit unique identifier), not a simple number.
+
+### The EFI System Partition (ESP)
+
+The ESP is a dedicated FAT32 partition (typically 256 MB to 1 GB) that UEFI firmware can read natively. It contains:
+
+```
+/boot/efi/  (mount point in Linux)
+└── EFI/
+    ├── BOOT/
+    │   └── BOOTX64.EFI         ← Fallback bootloader (removable media)
+    ├── ubuntu/
+    │   ├── shimx64.efi          ← Secure Boot shim
+    │   ├── grubx64.efi          ← GRUB bootloader
+    │   └── grub.cfg             ← GRUB configuration (or pointer to it)
+    ├── fedora/
+    │   ├── shimx64.efi
+    │   └── grubx64.efi
+    └── Microsoft/
+        └── Boot/
+            └── bootmgfw.efi    ← Windows Boot Manager
+```
+
+Multiple operating systems can coexist on the ESP. UEFI NVRAM stores named boot entries, each pointing to a specific `.efi` file.
+
+### GRUB — The Most Common Linux Bootloader
+
+**GRUB (GRand Unified Bootloader)** version 2 is the default bootloader on most Linux distributions. It is a sophisticated program that:
+
+- Understands dozens of filesystem types (ext4, XFS, Btrfs, FAT, NTFS...)
+- Can read the kernel and initramfs directly from the Linux filesystem
+- Presents a menu for choosing between kernels or operating systems
+- Supports scripting, theming, and network boot
+
+**GRUB Loading Sequence (UEFI path):**
+
+1. UEFI loads `shimx64.efi` from the ESP
+2. Shim verifies and loads `grubx64.efi`
+3. GRUB reads its configuration file (`grub.cfg`), usually from `/boot/grub/grub.cfg` on the root filesystem (GRUB can read ext4/XFS/Btrfs)
+4. GRUB presents a menu (or auto-selects the default after a timeout)
+5. GRUB loads two files into RAM:
+   - **The kernel image** (`vmlinuz-<version>`) — typically 8–12 MB, compressed
+   - **The initramfs** (`initramfs-<version>.img` or `initrd.img-<version>`) — typically 20–80 MB, compressed
+
+**GRUB Loading Sequence (BIOS/MBR path):**
+
+1. BIOS reads 512-byte MBR, executes the bootstrap code
+2. Bootstrap code loads GRUB Stage 1.5 from the **post-MBR gap** (the ~31 KB space between the MBR and the first partition) or from a dedicated BIOS Boot Partition on GPT disks
+3. Stage 1.5 has filesystem drivers, loads the full GRUB from `/boot/grub/`
+4. From here, same as steps 3–5 above
+
+### What exactly is loaded into memory
+
+After GRUB finishes, RAM looks like this:
+
+```
+RAM after bootloader
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  High memory                                                     │
+│  ┌─────────────────────────────────────────────┐                │
+│  │ initramfs image (compressed cpio archive)   │ loaded by GRUB │
+│  │ e.g., at physical address 0x3000_0000       │ ~20-80 MB      │
+│  └─────────────────────────────────────────────┘                │
+│                                                                  │
+│  ┌─────────────────────────────────────────────┐                │
+│  │ Kernel image (compressed, e.g., bzImage)    │ loaded by GRUB │
+│  │ e.g., at physical address 0x0100_0000 (16M) │ ~8-12 MB       │
+│  └─────────────────────────────────────────────┘                │
+│                                                                  │
+│  ┌─────────────────────────────────────────────┐                │
+│  │ Kernel boot parameters (command line)       │ set by GRUB    │
+│  │ e.g., "root=/dev/sda2 ro quiet splash"      │                │
+│  └─────────────────────────────────────────────┘                │
+│                                                                  │
+│  ┌─────────────────────────────────────────────┐                │
+│  │ GRUB code (will be overwritten later)       │                │
+│  └─────────────────────────────────────────────┘                │
+│                                                                  │
+│  Low memory (first 1 MB) — legacy structures, BIOS data        │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+GRUB also passes the **kernel command line** — a string of parameters that tells the kernel important things:
+- `root=/dev/sda2` — where the real root filesystem is
+- `ro` — mount root read-only initially
+- `quiet` — suppress most boot messages
+- `splash` — show a graphical splash screen
+- `init=/sbin/init` — which program to run as PID 1
+- `resume=/dev/sda3` — swap partition for hibernation resume
+
+### CPU Mode Transitions
+
+This is a subtle but important detail. The x86 CPU goes through several mode transitions during boot:
+
+```
+CPU Mode Transitions During Boot
+┌────────────┐    ┌────────────────┐    ┌──────────────────┐    ┌──────────────┐
+│ Real Mode  │ →  │ Protected Mode │ →  │ Long Mode (64-bit)│ → │ Kernel runs  │
+│ (16-bit)   │    │ (32-bit)       │    │                  │    │ in 64-bit    │
+│            │    │                │    │                  │    │ long mode    │
+│ Reset      │    │ BIOS/GRUB     │    │ UEFI or kernel   │    │              │
+│ vector     │    │ transitions    │    │ setup code       │    │              │
+└────────────┘    └────────────────┘    └──────────────────┘    └──────────────┘
+```
+
+- **Real Mode (16-bit)**: CPU starts here. Can address 1 MB. No memory protection. Used by legacy BIOS entirely.
+- **Protected Mode (32-bit)**: Adds memory protection, virtual memory, privilege levels (rings 0–3). Addresses up to 4 GB.
+- **Long Mode (64-bit)**: Full 64-bit addressing. The kernel runs here. UEFI firmware already runs in this mode; BIOS systems must transition through all three.
+
+The kernel image (`bzImage`) contains a small **real-mode setup header** followed by a **protected-mode kernel** followed by the **compressed 64-bit kernel**. When GRUB transfers control, the kernel's setup code handles the final transition to 64-bit long mode.
+
+### What would break if this stage fails
+
+- **Corrupted bootloader**: GRUB fails to load → "error: no such partition" or GRUB rescue shell.
+- **Missing kernel image**: GRUB shows "error: file '/vmlinuz...' not found."
+- **Missing initramfs**: The kernel boots but will likely panic when it cannot mount the root filesystem (unless the root FS driver is compiled directly into the kernel).
+- **Wrong kernel command line**: `root=` points to the wrong device → kernel panic: "VFS: Unable to mount root fs."
+- **Secure Boot mismatch**: Shim refuses to load unsigned GRUB → boot stops.
+
+---
+
+## Stage 3: Kernel Early Boot
+
+GRUB has placed the compressed kernel image and initramfs in RAM and jumped to the kernel's entry point. From this moment, the bootloader is gone — control is entirely with the kernel. There is no way back.
+
+### Kernel Decompression
+
+The Linux kernel image is typically compressed with algorithms like gzip, xz, lz4, or zstd. The file you see on disk as `vmlinuz` (the "z" stands for "compressed") is actually a small **decompressor stub** prepended to the compressed kernel.
+
+The decompression sequence:
+
+1. The decompressor stub (written in assembly and C) runs first
+2. It decompresses the kernel to a predetermined location in RAM (usually starting at the 16 MB mark or a randomized address if **KASLR** — Kernel Address Space Layout Randomization — is enabled)
+3. The decompressor jumps to the decompressed kernel's `startup_64` entry point (on x86-64)
+4. The decompressor code is no longer needed and its memory will be reclaimed later
+
+KASLR randomizes where the kernel is placed in physical and virtual memory. This makes it harder for exploits to predict where kernel code and data structures live. The random offset is chosen during this decompression phase.
+
+### Early Memory Management
+
+The kernel now needs to manage memory, but the full memory management subsystem is complex and has not been initialized yet. The kernel uses a simple **early boot allocator** (historically called `bootmem`, now replaced by `memblock`) to hand out memory during this phase.
+
+The kernel gets a **memory map** from the firmware (passed by the bootloader via the `e820` table on BIOS systems or the EFI memory map on UEFI systems). This map tells the kernel which physical address ranges are:
+- Usable RAM
+- Reserved by firmware
+- ACPI tables (hardware description data)
+- Memory-mapped I/O (device registers)
+- Defective (reported by firmware)
+
+```
+Example e820 Memory Map
+Range                          Type
+0x0000_0000 — 0x0009_FBFF     Usable          (first 640 KB, classic "low memory")
+0x0009_FC00 — 0x0009_FFFF     Reserved        (BIOS Extended Data Area)
+0x000E_0000 — 0x000F_FFFF     Reserved        (BIOS ROM shadow)
+0x0010_0000 — 0x7FFF_FFFF     Usable          (~2 GB of main RAM)
+0x8000_0000 — 0x8FFF_FFFF     Reserved        (PCI MMIO window)
+0xFEC0_0000 — 0xFEC0_0FFF     Reserved        (I/O APIC registers)
+0xFEE0_0000 — 0xFEE0_0FFF     Reserved        (Local APIC registers)
+0x1_0000_0000 — 0x2_7FFF_FFFF Usable          (RAM above 4 GB)
+```
+
+The kernel uses this map to set up **page tables** — the data structure that translates virtual addresses (what programs see) to physical addresses (actual RAM locations). On x86-64, the kernel maps all of physical RAM into a region of its virtual address space starting at `0xFFFF8880_00000000` (the **direct map**), so it can access any physical address simply by adding an offset.
+
+### Interrupt Setup
+
+**Interrupts** are signals that tell the CPU to stop what it is doing and handle an event. They are essential for a functioning system:
+
+- **Hardware interrupts**: A key press, a network packet arriving, a disk completing a read — hardware devices signal the CPU via interrupt lines
+- **Software interrupts / exceptions**: Division by zero, page fault (accessing memory that is not currently mapped), system calls from user programs
+
+The kernel sets up the **IDT (Interrupt Descriptor Table)** — a table of 256 entries, each pointing to a kernel function (called an **interrupt handler** or **ISR — Interrupt Service Routine**) that should run when a specific interrupt occurs.
+
+The kernel also programs the interrupt controllers:
+- **APIC (Advanced Programmable Interrupt Controller)** — each CPU core has a **Local APIC** for inter-processor interrupts and timers. The **I/O APIC** routes external device interrupts to CPU cores.
+- On older systems, the legacy **8259 PIC** is initialized and then typically disabled in favor of the APIC.
+
+### Built-in Drivers and Subsystem Initialization
+
+The kernel initializes its core subsystems in a specific order. Functions registered via special macros (`core_initcall`, `arch_initcall`, `subsys_initcall`, etc.) are called in priority order:
+
+1. **Memory management** (SLAB/SLUB allocator — the full memory allocator replaces the early boot allocator)
+2. **Scheduler** (decides which process runs on which CPU core)
+3. **Timer subsystem** (kernel timers, high-resolution timers)
+4. **VFS (Virtual Filesystem Switch)** — the abstraction layer that lets the kernel work with any filesystem type through a common interface
+5. **Console/serial drivers** — so the kernel can print boot messages (`dmesg`)
+6. **Built-in device drivers** — drivers compiled directly into the kernel image (as opposed to loadable modules). Only essential drivers are built in; most are modules.
+
+### Why the Kernel Cannot Yet Access the Real Disk
+
+This is a crucial point that justifies the existence of the next stage (initramfs).
+
+The real root filesystem (where `/`, `/usr`, `/etc`, `/bin` live) is on a disk. To read from that disk, the kernel needs:
+
+- **A storage driver**: AHCI for SATA, NVMe driver for NVMe SSDs, virtio-blk for VMs, device-mapper for LVM, md for software RAID
+- **A filesystem driver**: ext4, XFS, Btrfs, etc.
+- **Possibly a decryption layer**: LUKS/dm-crypt if the disk is encrypted
+- **Possibly a network stack**: if the root filesystem is on NFS or iSCSI
+
+These drivers are typically compiled as **loadable kernel modules** (`.ko` files), stored as files on the root filesystem itself. This creates a **chicken-and-egg problem**:
+
+> To mount the root filesystem, the kernel needs drivers.
+> To load the drivers, the kernel needs to read files from the root filesystem.
+> But the root filesystem is not mounted yet because the kernel does not have the drivers.
+
+The solution: **initramfs** — a temporary filesystem loaded into RAM by the bootloader, containing exactly the drivers and tools needed to mount the real root filesystem.
+
+### What memory contains at this point
+
+```
+RAM after kernel early boot
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  Kernel virtual address space (upper half)                       │
+│  ┌─────────────────────────────────────────────┐                │
+│  │ Kernel code (.text) — decompressed          │                │
+│  │ Kernel read-only data (.rodata)             │                │
+│  │ Kernel read-write data (.data, .bss)        │                │
+│  │ Page tables (mapping all physical RAM)      │                │
+│  │ IDT (interrupt handlers)                    │                │
+│  │ Per-CPU data structures                     │                │
+│  │ Early boot allocator metadata               │                │
+│  └─────────────────────────────────────────────┘                │
+│                                                                  │
+│  ┌─────────────────────────────────────────────┐                │
+│  │ initramfs image (still compressed in RAM)   │                │
+│  └─────────────────────────────────────────────┘                │
+│                                                                  │
+│  Free RAM (managed by the memory allocator)                     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### What filesystems are mounted
+
+None on disk. The kernel has initialized VFS but has not mounted anything yet. There is a temporary internal root (`rootfs`) which is an instance of `tmpfs` (a RAM-based filesystem).
+
+### What processes exist
+
+The kernel has created **one process**: process 0 (the **idle process** or **swapper**). It is not a real user-space process — it is the kernel's internal bookkeeping. No user-space process exists yet.
+
+### What would break if this stage fails
+
+- **Kernel panic during decompression**: Corrupted kernel image → "Kernel panic - not syncing: ..."
+- **Memory map errors**: Wrong memory regions → random corruption → unpredictable crashes
+- **IDT setup failure**: First hardware interrupt → CPU triple faults → instant reboot
+- **Failed subsystem initialization**: Depends on which subsystem. Scheduler failure → kernel panic. VFS failure → cannot mount anything → panic.
+
+---
+
+## Stage 4: initramfs — The Temporary Root
+
+### What initramfs Is
+
+**initramfs** (initial RAM filesystem) is a compressed archive that the bootloader places in RAM alongside the kernel. When the kernel needs to access the real root filesystem but lacks the drivers to do so, initramfs provides a complete minimal environment — a temporary root filesystem living entirely in RAM — that contains the necessary drivers, scripts, and tools to get the real root mounted.
+
+Technically, initramfs is a **gzip-compressed (or zstd/xz/lz4-compressed) cpio archive**. **cpio** is a simple archive format (like tar, but older and simpler) that the kernel can unpack with minimal code. The kernel has a built-in cpio extractor — it does not need any external tools to unpack initramfs.
+
+The older term **initrd** (initial RAM disk) refers to a legacy approach where a compressed filesystem image was loaded into a RAM-backed block device. Modern Linux uses initramfs exclusively, though the filename on disk is still often called `initrd.img` for historical reasons. The key difference: initrd was a block device with a real filesystem on it (ext2); initramfs is simply files unpacked into tmpfs.
+
+### How initramfs Is Unpacked
+
+1. The kernel locates the initramfs image in RAM (the bootloader told it the address and size)
+2. The kernel decompresses the archive
+3. The kernel extracts the cpio contents into `rootfs` — the internal tmpfs instance
+4. This becomes the root directory `/` for the system at this point
+
+After unpacking, the initramfs memory can look like this:
+
+```
+initramfs filesystem tree (example from an Ubuntu system)
+/
+├── bin/
+│   ├── busybox           ← Swiss-army-knife tool (many commands in one binary)
+│   ├── sh -> busybox     ← Minimal shell
+│   ├── mount
+│   ├── modprobe
+│   ├── blkid             ← Identifies filesystem types on block devices
+│   ├── cryptsetup        ← Disk encryption (if LUKS is used)
+│   ├── lvm               ← Logical volume management (if LVM is used)
+│   └── udevadm           ← Device manager control
+├── sbin/
+│   └── (more system tools)
+├── lib/
+│   ├── modules/
+│   │   └── 6.5.0-44-generic/
+│   │       └── kernel/
+│   │           ├── drivers/
+│   │           │   ├── ata/
+│   │           │   │   └── ahci.ko        ← SATA driver
+│   │           │   ├── nvme/
+│   │           │   │   └── nvme-core.ko   ← NVMe SSD driver
+│   │           │   ├── block/
+│   │           │   │   └── virtio_blk.ko  ← VM disk driver
+│   │           │   ├── md/
+│   │           │   │   └── dm-mod.ko      ← Device mapper (LVM, LUKS)
+│   │           │   └── scsi/
+│   │           │       └── sd_mod.ko      ← SCSI disk driver
+│   │           └── fs/
+│   │               ├── ext4/
+│   │               │   └── ext4.ko        ← ext4 filesystem driver
+│   │               ├── xfs/
+│   │               │   └── xfs.ko
+│   │               └── nfs/
+│   │                   └── nfs.ko
+│   └── udev/
+│       └── rules.d/                       ← udev rules for device detection
+├── etc/
+│   ├── modprobe.d/
+│   ├── udev/
+│   └── lvm/
+├── conf/
+│   └── conf.d/                            ← Configuration for initramfs scripts
+├── scripts/
+│   ├── init-top/
+│   ├── init-premount/
+│   ├── local-top/
+│   ├── local-premount/
+│   ├── local-bottom/
+│   └── init-bottom/                       ← Script hooks run at various stages
+├── dev/                                   ← Will be populated with device nodes
+├── proc/                                  ← Mount point for procfs
+├── sys/                                   ← Mount point for sysfs
+├── run/                                   ← Runtime data
+├── tmp/
+└── init                                   ← THE SCRIPT — the first thing that runs
+```
+
+### What `/init` Does
+
+The kernel, after unpacking initramfs, executes `/init` as PID 1 — the first user-space process on the system. This is typically a shell script (on Debian/Ubuntu systems using `initramfs-tools`) or a compiled binary (on Fedora/RHEL/Arch systems using `dracut`).
+
+Here is the logical sequence of what `/init` does:
+
+```
+/init execution flow
+┌────────────────────────────────────────────────────────────────┐
+│ 1. Mount /proc, /sys, /dev (virtual filesystems)              │
+│    - /proc: kernel process info and tunables                  │
+│    - /sys:  hardware/device hierarchy                         │
+│    - /dev:  device nodes (initially minimal, populated by     │
+│             udev or devtmpfs)                                 │
+│                                                               │
+│ 2. Parse kernel command line                                  │
+│    - Read /proc/cmdline                                       │
+│    - Extract root=, rootfstype=, resume=, cryptopts=, etc.    │
+│                                                               │
+│ 3. Start udev (device manager)                                │
+│    - udev listens for kernel device events                    │
+│    - Creates /dev/sda, /dev/nvme0n1, etc.                     │
+│    - Triggers module loading (kernel sends uevents for        │
+│      discovered hardware, udev matches rules and runs         │
+│      modprobe to load the correct driver module)              │
+│                                                               │
+│ 4. Load kernel modules                                        │
+│    - modprobe ahci           (SATA controller)                │
+│    - modprobe nvme           (NVMe controller)                │
+│    - modprobe ext4           (filesystem)                     │
+│    - modprobe dm_crypt       (if LUKS encrypted)              │
+│    - Modules are .ko files from /lib/modules/                 │
+│                                                               │
+│ 5. Wait for root device to appear                             │
+│    - Some devices (USB, iSCSI) take time to initialize        │
+│    - /init polls or uses udev events to detect when           │
+│      the root device (e.g., /dev/sda2) becomes available      │
+│    - Timeout: typically 30 seconds, then drops to emergency   │
+│      shell                                                    │
+│                                                               │
+│ 6. (Optional) Unlock encrypted root                           │
+│    - If root is LUKS-encrypted: prompt for passphrase         │
+│    - Run cryptsetup to create /dev/mapper/crypt-root          │
+│                                                               │
+│ 7. (Optional) Assemble LVM / RAID                             │
+│    - Activate LVM volume groups                               │
+│    - Assemble mdadm RAID arrays                               │
+│                                                               │
+│ 8. Mount the real root filesystem                             │
+│    - mount -t ext4 /dev/sda2 /sysroot                         │
+│    - Or: mount -t xfs /dev/mapper/vg0-root /sysroot           │
+│    - Mounted read-only initially                              │
+│                                                               │
+│ 9. Transition to real root (switch_root or pivot_root)        │
+│    - Move /proc, /sys, /dev mounts to /sysroot                │
+│    - Delete all files from the initramfs                      │
+│    - switch_root /sysroot /sbin/init                          │
+│      → changes / to /sysroot                                  │
+│      → exec's /sbin/init as the new PID 1                     │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### switch_root vs pivot_root
+
+Both accomplish the same goal — changing the root filesystem — but they work differently:
+
+**`pivot_root`**: Swaps the current root with a new one. The old root is still accessible at a mount point. Used by some initrd-based systems and containers.
+
+**`switch_root`**: Deletes everything in the current root (freeing the initramfs RAM), then moves to the new root. More efficient because it reclaims all memory used by initramfs. This is what modern initramfs implementations use.
+
+After `switch_root`:
+- The initramfs is completely gone from memory
+- `/` now refers to the real root filesystem on disk
+- PID 1 is now `/sbin/init` (systemd, SysVinit, or OpenRC) — the init system from the real root
+
+### What memory contains at this point
+
+```
+RAM after initramfs → real root transition
+┌──────────────────────────────────────────────────────────────────┐
+│  Kernel code and data structures (unchanged)                    │
+│  Page tables, IDT, scheduler, VFS                               │
+│  Loaded kernel modules (ahci, ext4, etc. — now in kernel space) │
+│  initramfs memory: FREED (reclaimed by the kernel)              │
+│  Buffer/page cache: starting to fill with data read from disk   │
+│  Process: PID 1 = /sbin/init (from real root filesystem)        │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### What filesystems are mounted
+
+| Mount point | Filesystem | Source | Notes |
+|-------------|------------|--------|-------|
+| `/` | ext4/XFS/Btrfs | `/dev/sda2` (real disk) | Mounted read-only initially |
+| `/proc` | procfs | kernel virtual | Moved from initramfs |
+| `/sys` | sysfs | kernel virtual | Moved from initramfs |
+| `/dev` | devtmpfs | kernel virtual | Moved from initramfs |
+
+### What processes exist
+
+| PID | Process | Role |
+|-----|---------|------|
+| 0 | `[swapper]` | Kernel idle thread (never seen by users) |
+| 1 | `/sbin/init` | The init system (just started, has not done much yet) |
+| 2 | `[kthreadd]` | Kernel thread manager (parent of all kernel threads) |
+| various | `[kworker/*]`, `[ksoftirqd/*]`, etc. | Kernel worker threads |
+
+### What would break if this stage fails
+
+- **initramfs missing or corrupt**: Kernel panic: "VFS: Unable to mount root fs on unknown-block(0,0)"
+- **Root device driver not in initramfs**: Root device never appears → timeout → dropped to initramfs emergency shell (`(initramfs)` prompt)
+- **Wrong `root=` parameter**: `/init` waits for a device that does not exist → timeout → emergency shell
+- **LUKS passphrase wrong**: Cannot unlock root → emergency shell
+- **Filesystem corruption**: `mount` fails → emergency shell
+- **switch_root fails**: Kernel panic — PID 1 exited
+
+---
+
+## Stage 5: The Real Root Filesystem
+
+### How `/` Is Mounted
+
+After `switch_root`, the kernel's root directory now points to the real disk-based filesystem. Initially, it was mounted **read-only** (`ro`) to prevent any writes to a potentially inconsistent filesystem. The init system (PID 1) will later remount it read-write after running filesystem checks if necessary.
+
+```bash
+# This is what happens inside the init system early in its startup:
+# 1. Check filesystem if needed
+fsck -a /dev/sda2
+# 2. Remount read-write
+mount -o remount,rw /
+```
+
+### What Must Exist at Minimum
+
+For a Linux system to function, the root filesystem must contain certain critical directories and files:
+
+```
+/ (root filesystem — minimum viable content)
+├── bin/           → Essential user command binaries (ls, cp, mount, sh)
+│                    (On modern systems, symlink to /usr/bin)
+├── sbin/          → Essential system binaries (init, fsck, ip, modprobe)
+│                    (On modern systems, symlink to /usr/sbin)
+├── lib/           → Essential shared libraries (libc.so, ld-linux.so)
+│   └── modules/   → Kernel modules for the running kernel
+│                    (On modern systems, symlink to /usr/lib)
+├── etc/           → System configuration files
+│   ├── fstab      → Filesystem mount table
+│   ├── passwd     → User accounts
+│   ├── shadow     → Password hashes
+│   ├── group      → Group definitions
+│   ├── hostname   → System hostname
+│   ├── os-release → Distribution identification
+│   └── systemd/   → systemd configuration (if using systemd)
+├── dev/           → Device nodes (populated by devtmpfs/udev)
+├── proc/          → procfs mount point
+├── sys/           → sysfs mount point
+├── run/           → Runtime data (tmpfs, created fresh each boot)
+├── tmp/           → Temporary files (often tmpfs)
+├── var/           → Variable data (logs, databases, mail, PID files)
+│   ├── log/       → System logs
+│   └── run/ → /run (symlink on modern systems)
+├── usr/           → Secondary hierarchy (see below)
+│   ├── bin/       → Most user commands live here now
+│   ├── sbin/      → Most system commands live here now
+│   ├── lib/       → Most libraries live here now
+│   └── share/     → Architecture-independent data
+├── home/          → User home directories
+├── root/          → Root user's home directory
+├── boot/          → Kernel and initramfs (sometimes separate partition)
+├── mnt/           → Temporary mount points
+├── opt/           → Optional/third-party software
+└── srv/           → Data for services (web, FTP)
+```
+
+### Why `/usr` Matters in Modern Systems
+
+Historically, `/bin`, `/sbin`, and `/lib` were on the root filesystem, while `/usr/bin`, `/usr/sbin`, and `/usr/lib` were on a separate partition that might not be available during early boot. This created a split: essential boot-time tools in `/bin`, everything else in `/usr/bin`.
+
+Modern distributions (Fedora, Arch, Ubuntu 24.04+, RHEL 8+) have implemented the **`/usr` merge**: `/bin` is a symlink to `/usr/bin`, `/sbin` to `/usr/sbin`, `/lib` to `/usr/lib`. All binaries and libraries live under `/usr/`.
+
+This means `/usr` **must** be available early in boot. If `/usr` is on a separate partition, it must be mounted in the initramfs before the init system starts — otherwise, even basic commands like `mount` or `systemctl` will not be found.
+
+```
+/usr merge in action
+/bin  →  /usr/bin      (symlink)
+/sbin →  /usr/sbin     (symlink)
+/lib  →  /usr/lib      (symlink)
+/lib64 → /usr/lib64    (symlink, on 64-bit systems)
+```
+
+### Virtual Filesystems
+
+Linux extensively uses **virtual filesystems** — filesystems that do not correspond to any storage device but are generated on-the-fly by the kernel to expose information and provide interfaces.
+
+**`/proc` (procfs)**
+
+```
+/proc/
+├── 1/                  ← Directory for PID 1 (init/systemd)
+│   ├── cmdline         ← Command line that started the process
+│   ├── status          ← Process status (state, memory, UIDs)
+│   ├── maps            ← Memory mappings
+│   ├── fd/             ← Open file descriptors (symlinks to files/sockets)
+│   ├── ns/             ← Namespace references
+│   ├── cgroup          ← cgroup membership
+│   └── ...
+├── cpuinfo             ← CPU model, features, cores
+├── meminfo             ← RAM usage statistics
+├── mounts              ← Currently mounted filesystems
+├── cmdline             ← Kernel command line
+├── uptime              ← Seconds since boot
+├── version             ← Kernel version string
+├── sys/                ← Kernel tunables (sysctl)
+│   ├── net/
+│   │   └── ipv4/
+│   │       └── ip_forward   ← Enable/disable IP forwarding
+│   ├── kernel/
+│   │   └── hostname         ← System hostname
+│   └── vm/
+│       └── swappiness       ← How aggressively to use swap
+├── interrupts          ← IRQ statistics
+├── partitions          ← Block device partitions
+└── filesystems         ← Supported filesystem types
+```
+
+Every file in `/proc` is generated by the kernel when you read it. There is no data stored on disk. Writing to files under `/proc/sys/` changes kernel parameters at runtime (this is what `sysctl` does).
+
+**`/sys` (sysfs)**
+
+```
+/sys/
+├── block/              ← Block devices (disks)
+│   ├── sda/
+│   │   ├── size        ← Disk size in 512-byte sectors
+│   │   ├── queue/      ← I/O scheduler parameters
+│   │   └── sda1/       ← Partition 1
+│   └── nvme0n1/
+├── bus/                ← Bus types
+│   ├── pci/
+│   │   └── devices/    ← PCI devices with their addresses
+│   └── usb/
+├── class/              ← Device classes
+│   ├── net/            ← Network interfaces
+│   │   ├── eth0/
+│   │   │   ├── address     ← MAC address
+│   │   │   ├── speed       ← Link speed
+│   │   │   └── statistics/ ← RX/TX counters
+│   │   └── wlan0/
+│   ├── block/
+│   └── tty/
+├── devices/            ← Device hierarchy (mirrors hardware topology)
+├── firmware/           ← Firmware interfaces (EFI variables, ACPI, DMI)
+│   └── efi/
+│       └── efivars/    ← UEFI NVRAM variables
+├── fs/                 ← Filesystem parameters
+│   └── cgroup/         ← cgroup v2 hierarchy
+├── kernel/             ← Kernel subsystem interfaces
+│   └── security/       ← Security module info (SELinux, AppArmor)
+├── module/             ← Loaded kernel modules with parameters
+└── power/              ← Power management (suspend, hibernate)
+```
+
+`/sys` exposes the kernel's device model — the internal data structure the kernel uses to track every device, driver, and bus in the system. Each file in `/sys` represents a single attribute of a device or subsystem.
+
+**`/dev` (devtmpfs + udev)**
+
+`/dev` is a tmpfs-based filesystem populated with **device nodes** — special files that represent hardware devices and pseudo-devices. Each device node has a **major** and **minor** number that the kernel uses to route operations to the correct driver.
+
+```
+/dev/
+├── sda               ← First SCSI/SATA disk (block device, major 8, minor 0)
+├── sda1              ← First partition on sda
+├── sda2              ← Second partition
+├── nvme0n1           ← First NVMe device
+├── nvme0n1p1         ← First partition on NVMe
+├── tty0              ← First virtual console
+├── ttyS0             ← First serial port
+├── pts/              ← Pseudo-terminals (SSH sessions, terminal emulators)
+│   ├── 0
+│   └── 1
+├── null              ← Data sink (write to it → data disappears)
+├── zero              ← Infinite source of zero bytes
+├── random            ← Cryptographically secure random data
+├── urandom           ← Non-blocking random data
+├── loop0             ← First loop device (for mounting disk images)
+├── mapper/           ← Device-mapper devices (LVM, LUKS)
+│   ├── vg0-root      ← LVM logical volume
+│   └── crypt-root    ← LUKS-unlocked device
+├── disk/
+│   ├── by-id/        ← Persistent device links by hardware ID
+│   ├── by-uuid/      ← Persistent device links by filesystem UUID
+│   ├── by-label/     ← Persistent device links by filesystem label
+│   └── by-path/      ← Persistent device links by hardware path
+├── shm/              ← POSIX shared memory
+├── stdin → /proc/self/fd/0
+├── stdout → /proc/self/fd/1
+└── stderr → /proc/self/fd/2
+```
+
+The device nodes under `/dev/disk/by-*` are created by **udev** (the userspace device manager) and are **symlinks** to the actual device names. They provide stable names that do not change when disks are added, removed, or reordered.
+
+### What would break if this stage fails
+
+- **Root filesystem corruption**: `fsck` might fix it (if minor), or the system drops to a recovery shell.
+- **Missing `/etc/fstab`**: The init system does not know what other filesystems to mount. System may boot but in a degraded state.
+- **Missing `/usr` (on merged systems)**: All commands fail because `/bin` → `/usr/bin` is a broken symlink.
+- **`/dev` not populated**: No device nodes → cannot access any hardware → system is unusable.
+- **`/proc` not mounted**: Thousands of tools break — `ps`, `top`, `free`, `sysctl`, the kernel itself relies on procfs for certain operations.
+
+---
+
+## Stage 6: PID 1 — The First Process
+
+### What PID 1 Means
+
+PID 1 is the first user-space process created by the kernel. It is special in several fundamental ways:
+
+1. **It is the ancestor of all other processes.** Every process on the system is either directly spawned by PID 1 or by a descendant of PID 1. If you draw a family tree of all processes, PID 1 is the root.
+
+2. **It cannot be killed.** The kernel refuses to deliver fatal signals (like SIGKILL) to PID 1 unless PID 1 has explicitly set up a handler for them. If PID 1 dies, the kernel panics — there is no way to recover, because there would be no process to adopt orphaned processes or keep the system running.
+
+3. **It adopts orphaned processes.** When a process dies, its children become orphans. The kernel re-parents orphans to PID 1. PID 1 must call `wait()` on these orphans to clean up their resources (process table entries). If PID 1 does not do this, orphaned processes become **zombies** — entries in the process table that consume resources and never go away.
+
+4. **It is responsible for system state.** PID 1 manages the overall state of the machine: booting, running, shutting down, rebooting.
+
+### The Init System: systemd
+
+On the vast majority of modern Linux distributions (Ubuntu, Fedora, RHEL, Debian, Arch, SUSE, etc.), PID 1 is **systemd**. Older systems used **SysVinit** (sequential shell scripts) or **Upstart** (event-based, used by Ubuntu until 2015).
+
+systemd is far more than a process launcher. It is a suite of programs that manage virtually every aspect of the running system:
+
+| Component | Binary | Purpose |
+|-----------|--------|---------|
+| Service manager | `systemd` (PID 1) | Start/stop/supervise services and mount filesystems |
+| Journal | `systemd-journald` | Centralized structured logging |
+| Login manager | `systemd-logind` | User sessions, seat management |
+| Network manager | `systemd-networkd` | Network configuration (optional) |
+| DNS resolver | `systemd-resolved` | Local DNS caching (optional) |
+| Time sync | `systemd-timesyncd` | NTP client (optional) |
+| Device manager | `systemd-udevd` | Device event handling (udev) |
+| Temporary files | `systemd-tmpfiles` | Create/clean temporary files and directories |
+| Hostname | `systemd-hostnamed` | Set and manage hostname |
+| Timer | `systemd` (timer units) | cron-like scheduled tasks |
+
+### What systemd Does When It Starts
+
+When `switch_root` exec's `/sbin/init` (which is a symlink to `/usr/lib/systemd/systemd`), systemd begins its initialization:
+
+```
+systemd (PID 1) Startup Sequence
+┌────────────────────────────────────────────────────────────────────┐
+│ 1. Read kernel command line (/proc/cmdline)                       │
+│    - Determine default target (graphical.target, multi-user, etc.)│
+│    - Check for emergency/rescue mode flags                        │
+│                                                                   │
+│ 2. Load configuration                                             │
+│    - /etc/systemd/system.conf (main config)                       │
+│    - /etc/machine-id (unique machine identifier)                  │
+│    - /etc/os-release                                              │
+│                                                                   │
+│ 3. Build the dependency tree                                      │
+│    - Read all .service, .mount, .socket, .target, .timer,         │
+│      .path, .slice unit files from:                               │
+│      - /usr/lib/systemd/system/ (distribution defaults)           │
+│      - /etc/systemd/system/ (admin overrides)                     │
+│      - /run/systemd/system/ (runtime overrides)                   │
+│    - Calculate the order and parallelization plan                  │
+│                                                                   │
+│ 4. Reach sysinit.target (basic system initialization)             │
+│    - Remount / read-write                                         │
+│    - Mount filesystems from /etc/fstab                             │
+│    - Activate swap                                                │
+│    - Set hostname                                                 │
+│    - Load kernel modules from /etc/modules-load.d/                │
+│    - Apply sysctl settings from /etc/sysctl.d/                    │
+│    - Start systemd-journald (logging)                             │
+│    - Start systemd-udevd (device manager)                         │
+│    - Set up /tmp, /var/run                                        │
+│    - Random seed restoration                                      │
+│                                                                   │
+│ 5. Reach basic.target                                             │
+│    - D-Bus system bus socket ready                                │
+│    - Sockets for socket-activated services ready                  │
+│    - Slice hierarchy for resource control ready                   │
+│                                                                   │
+│ 6. Reach multi-user.target or graphical.target                    │
+│    - Start all enabled services (in parallel where possible)      │
+│    - Start network configuration                                  │
+│    - Start login services                                         │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### systemd Targets (Runlevels)
+
+systemd uses **targets** instead of SysVinit's numbered runlevels. A target is a grouping of services that defines a system state:
+
+| Target | SysVinit Equivalent | Description |
+|--------|---------------------|-------------|
+| `emergency.target` | — | Single-user, root shell, no mounts, no services. Minimal debug. |
+| `rescue.target` | 1 (single-user) | Root shell with basic mounts. For repair. |
+| `multi-user.target` | 3 | Full system, all services, text login. No GUI. |
+| `graphical.target` | 5 | Full system with graphical display manager. |
+| `reboot.target` | 6 | System reboot. |
+| `poweroff.target` | 0 | System shutdown. |
+
+```
+Target Dependency Chain
+emergency.target
+    ↓
+rescue.target
+    ↓
+multi-user.target
+    ↓
+graphical.target
+
+Each target includes everything in the targets above it plus additional services.
+```
+
+### Mounting Additional Filesystems
+
+systemd reads `/etc/fstab` (filesystem table) and automatically generates `.mount` units for each entry. Example `/etc/fstab`:
+
+```
+# <device>              <mount point>  <type>   <options>         <dump> <pass>
+UUID=a1b2c3d4-...       /              ext4     defaults          0      1
+UUID=e5f6a7b8-...       /boot          ext4     defaults          0      2
+UUID=1234-ABCD          /boot/efi      vfat     umask=0077        0      1
+UUID=aabbccdd-...       /home          ext4     defaults          0      2
+UUID=deadbeef-...       none           swap     sw                0      0
+tmpfs                   /tmp           tmpfs    defaults,noatime  0      0
+```
+
+systemd mounts these in parallel where possible (respecting dependencies — `/home` must wait for `/` to be mounted).
+
+### What would break if this stage fails
+
+- **PID 1 crashes**: **Kernel panic.** The system is irrecoverable without rebooting.
+- **Corrupted unit files**: systemd may fail to parse them → affected services do not start.
+- **Missing `/etc/fstab`**: Non-root filesystems are not mounted.
+- **Missing `/etc/machine-id`**: systemd generates one, but some services may behave unexpectedly.
+- **Dependency cycle in units**: systemd detects and breaks cycles, but affected services may not start in the right order.
+
+---
+
+## Stage 7: Service Initialization
+
+Once systemd has performed basic system initialization, it starts the services that make the system actually useful. These services run as background processes (called **daemons** in Unix terminology — long-running processes that do not have a controlling terminal).
+
+### Device Manager (systemd-udevd)
+
+**udev** is the device manager for Linux. It runs as a daemon (`systemd-udevd`) and listens for **kernel uevents** — notifications the kernel sends when hardware is detected, added, or removed (e.g., plugging in a USB drive).
+
+What udev does:
+- Creates device nodes in `/dev/` (e.g., `/dev/sda`, `/dev/ttyUSB0`)
+- Creates persistent symlinks (`/dev/disk/by-uuid/`, `/dev/disk/by-id/`)
+- Loads firmware for devices that need it (some Wi-Fi cards, GPUs)
+- Sets device permissions and ownership
+- Triggers kernel module loading for newly discovered devices
+- Runs custom scripts when specific devices appear (e.g., auto-mount a USB stick)
+
+udev rules are stored in `/usr/lib/udev/rules.d/` (distribution defaults) and `/etc/udev/rules.d/` (admin customizations).
+
+### Logging (systemd-journald)
+
+`systemd-journald` is the centralized logging daemon. It collects:
+- All messages written to the kernel ring buffer (`dmesg` / `kmsg`)
+- All output from systemd-managed services (stdout and stderr)
+- Messages from the traditional syslog socket (`/dev/log`)
+- Audit messages from the kernel's audit subsystem
+
+Journal entries are stored in a structured binary format in `/var/log/journal/` (persistent) or `/run/log/journal/` (volatile, lost on reboot). You query the journal with `journalctl`.
+
+```bash
+journalctl -b              # All messages from current boot
+journalctl -u sshd         # Messages from sshd service
+journalctl -k              # Kernel messages only
+journalctl -f              # Follow (like tail -f)
+journalctl --since "5 min ago"
+```
+
+### Networking
+
+Network configuration can be handled by several components:
+
+| Tool | Description | Used by |
+|------|-------------|---------|
+| `systemd-networkd` | Lightweight network config daemon | Servers, containers, Ubuntu Server |
+| `NetworkManager` | Feature-rich, desktop-oriented | Desktop distros, laptops |
+| `ifupdown` / `netplan` | Legacy / abstraction layer | Debian, Ubuntu |
+
+Regardless of which tool is used, the process is:
+1. Detect network interfaces (physical NICs, virtual interfaces) via udev
+2. Apply configuration (IP address, gateway, DNS) — static or via DHCP
+3. Bring interfaces up
+4. Configure routing table
+5. Configure DNS resolver (`/etc/resolv.conf` or `systemd-resolved`)
+
+### Storage
+
+Beyond the root filesystem, additional storage services may start:
+- **LVM (Logical Volume Manager)**: `lvm2-monitor.service` — activates volume groups
+- **mdadm**: `mdmonitor.service` — monitors software RAID arrays
+- **iSCSI initiator**: Connects to network-attached block devices
+- **NFS client**: Mounts network filesystems
+- **Automount**: Mounts filesystems on-demand when accessed (via `autofs` or systemd `.automount` units)
+
+### Time Synchronization
+
+The system clock starts from the hardware RTC (Real-Time Clock) — a battery-backed clock chip on the motherboard. This provides a rough time, but it drifts and may not be set correctly.
+
+`systemd-timesyncd` (or the more capable `chronyd` / `ntpd`) synchronizes the system clock with remote NTP (Network Time Protocol) servers:
+
+```
+Time Synchronization
+┌─────────────┐         ┌──────────────────┐         ┌───────────────┐
+│ Hardware RTC │  boot → │ System Clock     │  NTP →  │ Accurate Time │
+│ (battery)    │         │ (may be wrong)   │         │ (from server) │
+└─────────────┘         └──────────────────┘         └───────────────┘
+```
+
+Accurate time is critical for:
+- TLS certificate validation (certificates have valid-from and valid-to dates)
+- Log correlation across multiple systems
+- Distributed systems (Kubernetes, databases)
+- Kerberos authentication (timestamps must be within 5 minutes)
+
+### Other Services
+
+Depending on the system's purpose, many other services start at this point:
+
+| Service | Purpose |
+|---------|---------|
+| `sshd` | Remote login via SSH |
+| `crond` | Scheduled task execution (cron jobs) |
+| `firewalld` / `iptables` | Firewall |
+| `auditd` | Security audit logging |
+| `dbus` | Inter-process communication bus |
+| `polkitd` | Authorization framework |
+| `docker` / `containerd` | Container runtime |
+| `kubelet` | Kubernetes node agent |
+| `httpd` / `nginx` | Web server |
+| `postgresql` / `mysql` | Database server |
+
+### What memory contains at this point
+
+RAM is now fully utilized:
+- Kernel code and data structures
+- Page cache (disk data cached in RAM for performance)
+- Dentry/inode caches (filesystem metadata)
+- Running service processes (each with its own virtual address space)
+- Network buffers
+- Device driver data structures
+
+### What filesystems are mounted
+
+All entries from `/etc/fstab` are mounted, plus virtual filesystems:
+
+```bash
+$ mount | column -t
+/dev/sda2      on  /            type  ext4      (rw,relatime)
+/dev/sda1      on  /boot        type  ext4      (rw,relatime)
+/dev/sda3      on  /boot/efi    type  vfat      (rw,umask=0077)
+/dev/sda5      on  /home        type  ext4      (rw,relatime)
+tmpfs          on  /tmp         type  tmpfs     (rw,nosuid,nodev)
+tmpfs          on  /run         type  tmpfs     (rw,nosuid,nodev,mode=755)
+devtmpfs       on  /dev         type  devtmpfs  (rw,nosuid)
+proc           on  /proc        type  proc      (rw,nosuid,nodev,noexec)
+sysfs          on  /sys         type  sysfs     (rw,nosuid,nodev,noexec)
+cgroup2        on  /sys/fs/cgroup  type  cgroup2  (rw,nosuid,nodev,noexec)
+```
+
+### What processes exist
+
+```
+Process Tree at Service Initialization
+systemd (PID 1)
+├── systemd-journald       (logging)
+├── systemd-udevd          (device management)
+├── systemd-logind         (user login management)
+├── systemd-networkd       (networking) [or NetworkManager]
+├── systemd-resolved       (DNS)
+├── systemd-timesyncd      (NTP time sync)
+├── dbus-daemon            (system message bus)
+├── sshd                   (SSH server)
+├── agetty (tty1)          (text console login prompt)
+├── agetty (tty2)
+├── agetty (tty3)
+├── crond                  (scheduled tasks)
+├── polkitd                (authorization)
+└── [other enabled services]
+```
+
+### What would break if this stage fails
+
+- **udev failure**: No device nodes → no storage, no input devices, no networking.
+- **journald failure**: No logs → debugging any subsequent failure becomes very difficult.
+- **Networking failure**: No remote access, no time sync, no NFS mounts, services depending on network fail.
+- **Time sync failure**: TLS connections may fail, log timestamps wrong, Kerberos auth breaks.
+
+---
+
+## Stage 8: Multi-User State and Login
+
+The system has reached its target state (`multi-user.target` for servers, `graphical.target` for desktops). All services are running. The system is ready for users to log in.
+
+### The Login Process — Text Console (TTY)
+
+On each virtual console (TTY), systemd spawns an instance of **`agetty`** (alternative getty). The historical term "getty" stands for "get tty" — it opens a terminal device, displays a login prompt, and waits.
+
+```
+Text Login Flow
+┌─────────────┐    ┌──────────────┐    ┌──────────────┐    ┌────────────┐
+│ systemd     │ →  │ agetty       │ →  │ login        │ →  │ user shell │
+│ (PID 1)     │    │ (shows       │    │ (checks      │    │ (bash/zsh) │
+│ starts      │    │  "login: "   │    │  password     │    │            │
+│ agetty      │    │  prompt)     │    │  via PAM)     │    │            │
+└─────────────┘    └──────────────┘    └──────────────┘    └────────────┘
+```
+
+Detailed steps:
+1. `agetty` opens the TTY device (e.g., `/dev/tty1`)
+2. `agetty` prints the login prompt (hostname and "login:")
+3. User types their username
+4. `agetty` exec's `/bin/login`, passing the username
+5. `login` prompts for the password
+6. `login` authenticates via **PAM (Pluggable Authentication Modules)** — PAM checks `/etc/shadow` (hashed passwords), LDAP, Kerberos, or other backends depending on configuration
+7. `login` sets up the user's environment:
+   - Changes UID/GID to the user's IDs (from `/etc/passwd`)
+   - Sets HOME, USER, SHELL, PATH environment variables
+   - Reads `/etc/profile`, `~/.bash_profile`, `~/.bashrc`
+   - Changes to the user's home directory
+   - Starts the user's login shell
+
+The user now has an interactive shell. The boot is complete for text-mode systems.
+
+### The Login Process — Graphical Desktop
+
+For systems with a graphical interface, the process is more complex.
+
+**1. Display Server**
+
+Before any graphical application can draw on screen, a **display server** must run. The display server manages the GPU, draws windows, and handles input events (keyboard, mouse).
+
+| Server | Description |
+|--------|-------------|
+| **X11 (Xorg/X.Org)** | The traditional display server, dating back to 1984. Client-server architecture. Still widely used but being replaced. |
+| **Wayland** | Modern replacement for X11. Simpler architecture, better security (applications cannot spy on each other's input). |
+
+**2. Display Manager (Login Screen)**
+
+A **display manager** (DM) is the graphical login screen. It is a program that:
+- Starts the display server (or runs as a Wayland compositor)
+- Shows a graphical login screen with username/password fields
+- Authenticates the user (via PAM, same as text login)
+- Starts the user's desktop session
+
+Common display managers:
+
+| DM | Used by |
+|----|---------|
+| GDM (GNOME Display Manager) | GNOME desktops (Ubuntu, Fedora) |
+| SDDM | KDE Plasma |
+| LightDM | Xfce, LXDE, many others |
+
+**3. Desktop Session**
+
+After authentication, the display manager starts the user's desktop environment:
+
+```
+Graphical Login Flow
+systemd (PID 1)
+└── gdm (display manager)
+    └── gdm-session-worker
+        └── gnome-session (user session)
+            ├── gnome-shell (window manager + compositor)
+            ├── gnome-settings-daemon
+            ├── gnome-keyring-daemon (secrets storage)
+            ├── dbus-daemon (user session bus)
+            ├── pulseaudio / pipewire (audio)
+            └── [user applications launched from here]
+```
+
+systemd also creates a **user instance** (`systemd --user`) for each logged-in user, managing user-specific services (file indexing, cloud sync, notification daemon, etc.).
+
+### Session Management
+
+`systemd-logind` tracks user sessions:
+
+```bash
+$ loginctl list-sessions
+SESSION  UID  USER   SEAT   TTY
+      1  1000 alice  seat0  tty2
+      c2 1000 alice         pts/0   (SSH session)
+```
+
+Each session has properties:
+- **Seat**: A set of hardware (display, keyboard, mouse) that forms a user's workstation
+- **TTY/PTY**: The terminal associated with the session
+- **Scope/slice**: The cgroup slice for resource tracking
+
+### What memory contains at this point
+
+The system is fully operational:
+
+```
+RAM Utilization in Running System
+┌────────────────────────────────────────────────────────────┐
+│ Kernel space (~100-500 MB depending on modules/drivers)   │
+│   - Kernel code, page tables, slab caches                 │
+│   - Network buffers, device driver state                  │
+│   - Page/dentry/inode caches (grows to fill free RAM)     │
+├────────────────────────────────────────────────────────────┤
+│ User space (remaining RAM)                                │
+│   - systemd and system services                           │
+│   - Display server (Xorg/Wayland compositor)              │
+│   - Desktop environment                                   │
+│   - User applications                                     │
+│   - Shared libraries (mapped once, shared by all users)   │
+├────────────────────────────────────────────────────────────┤
+│ Page cache (uses "free" RAM to cache disk data)           │
+│   - Automatically shrinks when applications need memory   │
+└────────────────────────────────────────────────────────────┘
+```
+
+### What processes exist
+
+Hundreds to thousands of processes. Example on a desktop system:
+
+```bash
+$ ps aux | wc -l
+287
+
+$ pstree -p | head -30
+systemd(1)─┬─ModemManager(567)
+            ├─NetworkManager(482)─┬─dhclient(15234)
+            │                     └─{NetworkManager}(510)
+            ├─agetty(563)
+            ├─avahi-daemon(470)
+            ├─crond(558)
+            ├─dbus-daemon(466)
+            ├─firewalld(476)
+            ├─gdm(581)─┬─gdm-session-wor(1023)─┬─gdm-wayland-ses(1045)
+            │           │                       │   └─gnome-session-b(1050)
+            │           │                       │       ├─gnome-shell(1112)
+            │           │                       │       └─...
+            │           └─{gdm}(583)
+            ├─polkitd(480)
+            ├─sshd(544)─┬─sshd(2341)───sshd(2350)───bash(2351)
+            │            └─sshd(3101)───sshd(3110)───bash(3111)
+            ├─systemd-journal(321)
+            ├─systemd-logind(479)
+            ├─systemd-udevd(347)
+            └─...
+```
+
+### What would break if this stage fails
+
+- **agetty failure**: No login prompt on that TTY. Other TTYs still work.
+- **PAM misconfiguration**: Nobody can log in — locked out of the system (need recovery/single-user mode).
+- **Display manager crash**: No graphical login. Text consoles still work.
+- **GPU driver failure**: Display manager cannot start. Falls back to text mode.
+- **User shell not found**: Login succeeds but immediately closes (user's shell in `/etc/passwd` does not exist).
+
+### Boot Complete
+
+The system is now fully operational. Here is a timeline summary of the entire host boot:
+
+```
+Complete Boot Timeline
+ Time     Stage                        What happens
+──────────────────────────────────────────────────────────────────────
+ 0.0 s    Power On                     PSU stabilizes, CPU released from reset
+ 0.0 s    Reset Vector                 CPU begins at 0xFFFFFFF0
+ 0.0 s    Firmware (SEC/PEI)           Cache-as-RAM, memory training
+ ~3 s     Firmware (DXE/BDS)           Hardware init, device enum, find bootloader
+ ~5 s     Bootloader (GRUB)            Load kernel + initramfs into RAM
+ ~6 s     Kernel Decompression         Decompress, enter long mode
+ ~7 s     Kernel Early Init            Memory, interrupts, VFS, scheduler
+ ~8 s     initramfs /init              udev, modprobe, mount real root
+ ~9 s     switch_root                  Transition to real root, exec systemd
+ ~10 s    systemd basic init           Remount rw, fstab, logging, udev
+ ~12 s    Service start                Networking, SSH, time sync, firewall
+ ~15 s    multi-user.target            Login available (text mode)
+ ~20 s    graphical.target             Display manager ready (desktop)
+──────────────────────────────────────────────────────────────────────
+ Total: 15–30 seconds on modern hardware (varies widely)
+```
+
+---
+
+## Part 2 — Container Initialization
+
+## What a Container Is (And Is Not)
+
+Before explaining container startup, let's be precise about what a container is.
+
+**A container is NOT a virtual machine.** A virtual machine (VM) emulates entire hardware — it has its own virtual CPU, virtual RAM, virtual disks, and runs its own kernel. A container, by contrast, is a set of **isolated processes running on the host kernel**.
+
+Think of it this way:
+
+```
+Virtual Machine vs Container
+
+┌─── Host Machine ─────────────────────────────────────────────────────────┐
+│                                                                          │
+│  ┌── VM 1 ──────────────────┐    ┌── VM 2 ──────────────────┐          │
+│  │ ┌──────────────────────┐ │    │ ┌──────────────────────┐ │          │
+│  │ │ App A                │ │    │ │ App B                │ │          │
+│  │ ├──────────────────────┤ │    │ ├──────────────────────┤ │          │
+│  │ │ Guest OS (kernel +   │ │    │ │ Guest OS (kernel +   │ │          │
+│  │ │ userspace)           │ │    │ │ userspace)           │ │          │
+│  │ └──────────────────────┘ │    │ └──────────────────────┘ │          │
+│  │ Virtual hardware          │    │ Virtual hardware          │          │
+│  └───────────────────────────┘    └───────────────────────────┘          │
+│                                                                          │
+│  ┌── Hypervisor (VMware, KVM, QEMU, Hyper-V) ──────────────────────┐   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│  ┌── Host OS + Host Kernel ─────────────────────────────────────────┐   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│  ┌── Physical Hardware ─────────────────────────────────────────────┐   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─── Host Machine ─────────────────────────────────────────────────────────┐
+│                                                                          │
+│  ┌── Container 1 ──┐    ┌── Container 2 ──┐    ┌── Container 3 ──┐     │
+│  │ App A           │    │ App B           │    │ App C           │     │
+│  │ Libs + bins     │    │ Libs + bins     │    │ Libs + bins     │     │
+│  └─────────────────┘    └─────────────────┘    └─────────────────┘     │
+│                                                                          │
+│  ┌── Container Runtime (containerd, runc) ──────────────────────────┐   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│  ┌── Host OS + Host Kernel (SHARED) ────────────────────────────────┐   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│  ┌── Physical Hardware ─────────────────────────────────────────────┐   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+A container is:
+- **A group of one or more processes** running on the host
+- **Isolated** from other processes and from the host using **namespaces**
+- **Resource-controlled** using **cgroups**
+- **Running with a separate root filesystem** (but on the host kernel's VFS)
+- **Sharing the host kernel** — the container does not have its own kernel
+
+A container is implemented entirely with standard Linux kernel features. There is no "container" abstraction in the kernel itself — it is a **userspace concept** built on top of namespaces, cgroups, and filesystem isolation.
+
+---
+
+## What the Host Kernel Already Provides
+
+When a container starts, the host has already completed the entire boot process described in Part 1. Everything is already running:
+
+| Resource | Status | Available to containers? |
+|----------|--------|--------------------------|
+| CPU | Initialized, scheduler running | Yes, shared via cgroups |
+| RAM | Initialized, allocator running | Yes, shared via cgroups |
+| Storage drivers | Loaded | Yes, containers use host's block devices |
+| Filesystem drivers | Loaded | Yes, containers use host's VFS |
+| Network stack | Fully operational | Yes, containers get virtual interfaces |
+| Device drivers | Loaded | Selectively (most devices not exposed) |
+| Process scheduler | Running | Yes, container processes are scheduled normally |
+| System calls | Available | Yes (can be filtered with seccomp) |
+| Virtual filesystems (/proc, /sys) | Mounted | Containers get their own filtered views |
+
+The kernel is like a building's foundation and infrastructure — plumbing, electrical, HVAC. Containers are like apartments in that building. Each apartment has its own layout and furniture, but they all share the building's infrastructure.
+
+---
+
+## What a Container Skips Entirely
+
+A container does not go through **any** of Part 1's stages 0 through 5:
+
+```
+Host Boot vs Container — What Gets Skipped
+
+Host Boot Stage                    Container Equivalent
+─────────────────────────────────────────────────────────
+Stage 0: Power On                  SKIPPED — host already powered
+Stage 1: Firmware (BIOS/UEFI)     SKIPPED — host firmware already ran
+Stage 2: Bootloader (GRUB)         SKIPPED — no kernel to load
+Stage 3: Kernel Early Boot          SKIPPED — host kernel already running
+Stage 4: initramfs                  SKIPPED — no root device to find
+Stage 5: Real Root Filesystem       REPLACED — container gets its own rootfs
+Stage 6: PID 1                      REPLACED — container has its own PID 1
+Stage 7: Service Initialization     REPLACED — container runs its entrypoint
+Stage 8: Multi-User State           REPLACED — container runs its workload
+```
+
+This is why containers start in **milliseconds** instead of seconds or minutes.
+
+---
+
+## Namespaces — Isolation Boundaries
+
+Namespaces are the core kernel feature that makes containers possible. Each namespace type isolates a specific system resource, giving the container's processes the illusion that they have their own independent copy of that resource.
+
+There are 8 namespace types (as of Linux 5.6+):
+
+### 1. PID Namespace (`pid`)
+
+Isolates the process ID number space. Inside the container, the first process is PID 1. On the host, that same process has a different PID (e.g., PID 48293).
+
+```
+PID Namespace Isolation
+
+Host PID Namespace                    Container PID Namespace
+┌──────────────────────┐              ┌──────────────────────┐
+│ PID 1: systemd       │              │ PID 1: nginx         │  ← same process
+│ PID 2: kthreadd      │              │ PID 2: nginx worker  │     as host PID
+│ ...                   │              │ PID 3: nginx worker  │     48293
+│ PID 48293: nginx     ─┼──────────── │                      │
+│ PID 48294: nginx wkr ─┼──────────── │                      │
+│ PID 48295: nginx wkr ─┼──────────── │                      │
+│ ...                   │              └──────────────────────┘
+│ PID 50102: redis     ─┼──────────── ┌──────────────────────┐
+│ ...                   │              │ PID 1: redis-server  │
+└──────────────────────┘              └──────────────────────┘
+```
+
+The container cannot see or signal processes outside its namespace. From the container's perspective, only its own processes exist. The host can see everything.
+
+### 2. Mount Namespace (`mnt`)
+
+Isolates the filesystem mount table. The container has its own set of mounts, independent of the host. This is how a container gets its own root filesystem — the container runtime creates a new mount namespace and mounts the container's filesystem as `/` within that namespace.
+
+```
+Mount Namespace Isolation
+
+Host Mount Table              Container Mount Table
+/ (ext4, /dev/sda2)          / (overlay, container image)
+├── /boot                    ├── /etc (from image)
+├── /home                    ├── /usr (from image)
+├── /proc                    ├── /proc (new procfs instance)
+├── /sys                     ├── /sys (restricted sysfs)
+├── /var                     ├── /dev (minimal)
+│   └── /var/lib/docker      └── /app (application code)
+└── /tmp
+```
+
+The container sees a completely different directory tree than the host.
+
+### 3. Network Namespace (`net`)
+
+Isolates network interfaces, routing tables, iptables rules, and sockets. Each container gets its own virtual network stack.
+
+```
+Network Namespace Isolation
+
+Host Network                        Container Network
+┌─────────────────────────┐        ┌─────────────────────────┐
+│ eth0: 192.168.1.100     │        │ eth0: 172.17.0.2        │ ← virtual
+│ docker0: 172.17.0.1     │        │ lo:   127.0.0.1         │   interface
+│ vethABC123 ─────────────┼────────┤                         │   (veth pair)
+│ lo: 127.0.0.1           │        │ Routes:                 │
+│                         │        │  default via 172.17.0.1 │ ← host's
+│ Routes:                 │        │                         │   docker0
+│  default via 192.168.1.1│        └─────────────────────────┘
+└─────────────────────────┘
+```
+
+The container's `eth0` is one end of a **veth (virtual Ethernet) pair**. The other end is in the host's network namespace, attached to a bridge (like `docker0`). The host acts as a router for the container.
+
+### 4. UTS Namespace (`uts`)
+
+Isolates the hostname and NIS domain name. Each container can have its own hostname:
+
+```bash
+# On the host:
+$ hostname
+production-server
+
+# Inside the container:
+$ hostname
+my-app-container-1
+```
+
+### 5. IPC Namespace (`ipc`)
+
+Isolates **Inter-Process Communication** resources: System V shared memory segments, message queues, and semaphores. Processes inside the container can only see IPC resources created within the same IPC namespace. This prevents containers from interfering with each other's shared memory.
+
+### 6. User Namespace (`user`)
+
+Maps UIDs and GIDs between the container and the host. A process can be root (UID 0) inside the container but a regular unprivileged user (e.g., UID 100000) on the host. This is called **rootless containers** and significantly improves security.
+
+```
+User Namespace Mapping
+
+Container UID    Host UID
+    0 (root)  →  100000 (unprivileged)
+    1         →  100001
+    2         →  100002
+    ...          ...
+    65535     →  165535
+```
+
+### 7. Cgroup Namespace (`cgroup`)
+
+Isolates the view of the cgroup hierarchy. The container sees its own cgroup as the root, preventing it from discovering or manipulating the host's cgroup structure.
+
+### 8. Time Namespace (`time`)  *(Linux 5.6+)*
+
+Isolates the system monotonic and boottime clocks. A container can have its own view of "time since boot." (Note: wall-clock time is still shared with the host.)
+
+### How Namespaces Are Created
+
+When you run `docker run`, the container runtime (runc) uses two system calls:
+- **`clone()`** with namespace flags to create a new process in new namespaces
+- **`unshare()`** to move an existing process into new namespaces
+- **`setns()`** to join an existing namespace (used by `docker exec`)
+
+```c
+// Simplified: what runc does internally
+int flags = CLONE_NEWPID  |  // new PID namespace
+            CLONE_NEWNS   |  // new mount namespace
+            CLONE_NEWNET  |  // new network namespace
+            CLONE_NEWUTS  |  // new UTS namespace
+            CLONE_NEWIPC  |  // new IPC namespace
+            CLONE_NEWUSER;   // new user namespace (if rootless)
+
+pid_t child = clone(container_init, stack_top, flags | SIGCHLD, args);
+```
+
+---
+
+## cgroups — Resource Control
+
+While namespaces provide **isolation** (what can a container see?), **cgroups (control groups)** provide **resource control** (how much can a container use?).
+
+cgroups are a kernel mechanism that organizes processes into hierarchical groups and applies resource limits, accounting, and priorities to those groups.
+
+### What cgroups control
+
+| Resource | cgroup Controller | What it limits |
+|----------|-------------------|----------------|
+| CPU | `cpu` | CPU time share, CPU pinning (which cores to use) |
+| Memory | `memory` | RAM limit, swap limit, OOM (Out of Memory) behavior |
+| I/O | `io` | Disk read/write bandwidth, IOPS |
+| PIDs | `pids` | Maximum number of processes (prevents fork bombs) |
+| Network | `net_cls`, `net_prio` | Traffic classification, priority (cgroup v1) |
+| Huge pages | `hugetlb` | Huge page allocation limits |
+| CPU sets | `cpuset` | Pin processes to specific CPU cores and NUMA nodes |
+
+### cgroup Hierarchy
+
+cgroups are organized in a tree structure (visible at `/sys/fs/cgroup/` on cgroup v2 systems):
+
+```
+/sys/fs/cgroup/                           (root cgroup)
+├── system.slice/                          (system services)
+│   ├── sshd.service/
+│   ├── docker.service/
+│   └── nginx.service/
+├── user.slice/                            (user sessions)
+│   └── user-1000.slice/
+└── docker/                                (container cgroups)
+    ├── abc123def456.../                    (container 1)
+    │   ├── cgroup.procs                   (PIDs in this group)
+    │   ├── memory.max                     (memory limit: e.g., 536870912 = 512MB)
+    │   ├── memory.current                 (current usage)
+    │   ├── cpu.max                        (CPU quota: e.g., "50000 100000" = 50%)
+    │   ├── pids.max                       (max processes: e.g., 100)
+    │   └── io.max                         (I/O limits)
+    └── fed789abc012.../                    (container 2)
+        └── ...
+```
+
+When you run `docker run --memory=512m --cpus=0.5`, Docker:
+1. Creates a new cgroup directory
+2. Writes `536870912` to `memory.max` (512 MB in bytes)
+3. Writes `50000 100000` to `cpu.max` (50ms per 100ms period = 50% CPU)
+4. Puts the container's PID into `cgroup.procs`
+
+If the container tries to use more than 512 MB of RAM, the kernel's OOM killer terminates processes inside the cgroup.
+
+---
+
+## The Container Root Filesystem
+
+### Image Layers and OverlayFS
+
+When you pull a Docker image (e.g., `docker pull nginx`), you download a set of **layers**. Each layer is a tar archive containing filesystem changes (added files, modified files, deleted files).
+
+```
+Docker Image Layers (nginx example)
+
+Layer 4: COPY index.html /usr/share/nginx/html/     (your custom HTML)
+Layer 3: RUN apt-get install -y nginx                (nginx binaries + config)
+Layer 2: RUN apt-get update                          (updated package lists)
+Layer 1: FROM debian:bookworm                        (base OS: libc, coreutils, apt)
+```
+
+These layers are stacked using **OverlayFS** — a union filesystem that merges multiple directories into a single view:
+
+```
+OverlayFS Stack
+
+┌─────────────────────────────────────────┐
+│ Container's View of /                    │
+│ (merged: union of all layers + writable) │
+├─────────────────────────────────────────┤
+│ Upper (writable layer)                   │ ← New/modified files go here
+│ /var/lib/docker/overlay2/abc.../diff     │    (this is ephemeral — deleted when
+│                                          │     container is removed)
+├─────────────────────────────────────────┤
+│ Layer 4 (read-only)                      │ ← index.html
+├─────────────────────────────────────────┤
+│ Layer 3 (read-only)                      │ ← nginx binaries
+├─────────────────────────────────────────┤
+│ Layer 2 (read-only)                      │ ← updated package lists
+├─────────────────────────────────────────┤
+│ Layer 1 (read-only)                      │ ← Debian base files
+└─────────────────────────────────────────┘
+```
+
+When a process inside the container reads a file:
+1. OverlayFS checks the upper layer first
+2. If not found, checks each lower layer from top to bottom
+3. Returns the first match
+
+When a process writes a file:
+1. If the file exists in a lower layer, OverlayFS **copies it up** to the upper layer first (copy-on-write)
+2. The write goes to the upper layer copy
+3. Lower layers are never modified (they may be shared by other containers using the same image)
+
+### What replaces initramfs in container context
+
+In a host boot, initramfs exists to solve the chicken-and-egg problem of needing disk drivers to read the root filesystem. Containers have no such problem:
+
+- The host kernel already has all filesystem drivers loaded
+- The container's root filesystem is just a directory on the host's already-mounted filesystem
+- No device drivers need to be loaded
+- No disk needs to be discovered
+
+There is no initramfs equivalent in containers. The container runtime simply:
+1. Prepares the overlay mount
+2. Uses `pivot_root` or `chroot` to change the container process's root to the overlay merged directory
+3. Executes the container's entrypoint
+
+---
+
+## PID 1 Inside a Container
+
+Inside a container, PID 1 has different responsibilities than the host's PID 1 (systemd). The container's PID 1 is whatever program the container image specifies as its **ENTRYPOINT** or **CMD**.
+
+```dockerfile
+# In a Dockerfile:
+FROM nginx:latest
+# nginx becomes PID 1 inside the container:
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+### Why PID 1 in a container is tricky
+
+PID 1 inside a container has the same special kernel behaviors as PID 1 on the host:
+
+1. **Signal handling**: By default, PID 1 does not receive SIGTERM or SIGINT unless it has explicitly registered a handler. This means `docker stop` (which sends SIGTERM) may not gracefully stop the container if PID 1 does not handle SIGTERM. Docker waits 10 seconds and then sends SIGKILL (uncatchable).
+
+2. **Zombie reaping**: If PID 1 spawns child processes that exit, it must call `wait()` to reap them. Many application programs (nginx, python scripts) are not designed to be PID 1 and do not reap zombies.
+
+Solutions:
+- Use `--init` flag (`docker run --init ...`), which injects **tini** — a tiny init process — as PID 1. Tini forwards signals and reaps zombies.
+- Use **dumb-init** or similar tools for the same purpose.
+- Design the application to handle signals and reap children.
+
+```
+Container Process Tree
+
+Without --init:                     With --init:
+PID 1: python app.py               PID 1: tini (init shim)
+                                    └── PID 2: python app.py
+
+Tini forwards SIGTERM to app.py and reaps any zombie children.
+```
+
+### Full container startup sequence
+
+Here is exactly what happens when you run `docker run -d --name web -p 80:80 nginx`:
+
+```
+Container Startup Sequence (docker run)
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 1. Docker CLI sends request to Docker daemon (dockerd)                 │
+│                                                                        │
+│ 2. dockerd calls containerd (the container runtime manager)            │
+│                                                                        │
+│ 3. containerd prepares the container:                                  │
+│    a. Resolves image layers → assembles overlay mount                  │
+│    b. Creates an OCI runtime bundle (config.json + rootfs)             │
+│    c. Sets up networking (creates veth pair, assigns IP)               │
+│    d. Calls containerd-shim → runc (the OCI runtime)                   │
+│                                                                        │
+│ 4. runc creates the container:                                         │
+│    a. Creates namespaces (clone() with CLONE_NEW* flags)               │
+│    b. Sets up cgroups (creates cgroup dir, writes limits)              │
+│    c. Mounts the overlay filesystem as the container's root            │
+│    d. Mounts /proc (new procfs instance in the new PID namespace)     │
+│    e. Mounts /sys (restricted view)                                    │
+│    f. Mounts /dev (minimal: null, zero, random, urandom, tty, etc.)   │
+│    g. Sets hostname (UTS namespace)                                    │
+│    h. Configures network interface inside container namespace          │
+│    i. Applies seccomp filters (restricts which syscalls are allowed)   │
+│    j. Drops capabilities (restricts what root can do)                  │
+│    k. pivot_root to container rootfs                                   │
+│    l. exec() the entrypoint: nginx -g "daemon off;"                    │
+│                                                                        │
+│ 5. nginx is now PID 1 inside the container's PID namespace             │
+│    nginx is PID 48293 (or similar) in the host's PID namespace         │
+│                                                                        │
+│ Total time: ~100-500 milliseconds                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Virtual Filesystems in Containers
+
+Containers get their own views of `/proc`, `/sys`, and `/dev`, but these views are **restricted** compared to the host.
+
+### `/proc` inside a container
+
+The container gets a new procfs instance mounted in its PID namespace. Key differences:
+
+| Path | Host View | Container View |
+|------|-----------|----------------|
+| `/proc/[pid]` | All host processes | Only container's processes |
+| `/proc/meminfo` | Total host RAM | Host's total (or cgroup-aware if patched) |
+| `/proc/cpuinfo` | All host CPUs | All host CPUs (not masked by default) |
+| `/proc/sys/` | Writable (if root) | Mostly read-only (mounted with restrictions) |
+| `/proc/kcore` | Kernel memory | Not accessible (masked) |
+| `/proc/keys` | Kernel keyrings | Not accessible (masked) |
+
+Docker masks sensitive `/proc` entries by bind-mounting `/dev/null` or empty directories over them:
+```bash
+# These paths are masked inside Docker containers:
+/proc/kcore        → /dev/null
+/proc/keys         → /dev/null
+/proc/timer_list   → /dev/null
+/proc/sched_debug  → /dev/null
+/proc/scsi         → empty dir (read-only)
+```
+
+### `/sys` inside a container
+
+Containers get a **read-only** mount of sysfs. Most of `/sys` is inaccessible because containers should not be able to:
+- Change kernel parameters
+- Access hardware directly
+- Modify device configurations
+
+### `/dev` inside a container
+
+Containers get a minimal `/dev` with only essential pseudo-devices:
+
+```
+/dev/ inside a container
+├── null        ← Data sink
+├── zero        ← Infinite zeros
+├── random      ← Random data
+├── urandom     ← Non-blocking random data
+├── tty         ← Controlling terminal
+├── console     ← Console device
+├── pts/        ← Pseudo-terminals
+├── mqueue/     ← POSIX message queues
+├── shm/        ← Shared memory
+├── fd → /proc/self/fd
+├── stdin → /proc/self/fd/0
+├── stdout → /proc/self/fd/1
+└── stderr → /proc/self/fd/2
+```
+
+No disk devices (`/dev/sda`), no USB devices, no GPU devices (unless explicitly passed through with `--device` or `--gpus`).
+
+---
+
+## Container Networking
+
+Container networking is fundamentally different from host networking because it relies on **virtual network interfaces** rather than physical hardware.
+
+### Default Bridge Networking (Docker)
+
+```
+Docker Bridge Network Architecture
+
+┌───── Host ─────────────────────────────────────────────────────────┐
+│                                                                    │
+│  ┌─── Container 1 ─────┐     ┌─── Container 2 ─────┐            │
+│  │ eth0: 172.17.0.2     │     │ eth0: 172.17.0.3     │            │
+│  │         │             │     │         │             │            │
+│  └─────────┼─────────────┘     └─────────┼─────────────┘            │
+│            │ (veth pair)                  │ (veth pair)              │
+│            │                              │                          │
+│  ┌─────── vethABC ──────────── vethDEF ────────────────────────┐   │
+│  │                docker0 bridge (172.17.0.1)                   │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                              │                                      │
+│                    iptables NAT (MASQUERADE)                        │
+│                              │                                      │
+│                        eth0: 192.168.1.100                          │
+│                        (physical NIC)                                │
+│                              │                                      │
+└──────────────────────────────┼──────────────────────────────────────┘
+                               │
+                          To the network
+```
+
+How it works:
+1. Docker creates a **bridge** interface (`docker0`) — a virtual network switch
+2. For each container, Docker creates a **veth pair** — two virtual Ethernet interfaces connected together like a pipe
+3. One end of the veth pair goes inside the container's network namespace (appears as `eth0`)
+4. The other end stays in the host namespace and is attached to the `docker0` bridge
+5. The container gets an IP address from Docker's subnet (e.g., `172.17.0.0/16`)
+6. **iptables NAT rules** on the host translate between the container's private IP and the host's real IP (MASQUERADE for outgoing traffic, DNAT for port forwards)
+
+When you use `-p 80:80`, Docker adds a DNAT iptables rule:
+```
+-A DOCKER -p tcp --dport 80 -j DNAT --to-destination 172.17.0.2:80
+```
+
+### Other Networking Modes
+
+| Mode | Command | Description |
+|------|---------|-------------|
+| Bridge (default) | `docker run ...` | Isolated network with NAT to host |
+| Host | `docker run --net=host` | Container shares host's network namespace. No isolation, full performance. |
+| None | `docker run --net=none` | No networking at all (fully isolated) |
+| Container | `docker run --net=container:X` | Shares another container's network namespace |
+| Macvlan | (network driver config) | Container gets its own MAC address on the physical network |
+| Overlay | (Swarm/K8s) | Multi-host container networking via VXLAN tunnels |
+
+---
+
+## Container Storage
+
+Container storage differs fundamentally from host storage:
+
+### Ephemeral by default
+
+All writes inside a container go to the upper (writable) layer of OverlayFS. When the container is removed (`docker rm`), the upper layer is deleted. **All data written inside the container is lost.** This is by design — containers are meant to be disposable.
+
+### Persistent storage options
+
+| Method | Command | Description |
+|--------|---------|-------------|
+| **Named volume** | `-v mydata:/app/data` | Docker manages a directory on the host (`/var/lib/docker/volumes/mydata/`). Survives container removal. |
+| **Bind mount** | `-v /host/path:/container/path` | Directly maps a host directory into the container. The container sees the host's files. |
+| **tmpfs mount** | `--tmpfs /tmp` | RAM-backed filesystem inside the container. Fast but volatile. |
+
+```
+Container Storage Architecture
+
+┌─── Container ──────────────────────────────────────────────┐
+│                                                            │
+│ /                    → OverlayFS (ephemeral)               │
+│ /app/data            → Named volume (persistent)           │
+│ /config              → Bind mount from host (persistent)   │
+│ /tmp                 → tmpfs (RAM, volatile)               │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+              │                   │
+              ▼                   ▼
+    /var/lib/docker/       /host/config/
+    volumes/mydata/        (host filesystem)
+```
+
+---
+
+## Why Containers Start Instantly
+
+Now that you understand both the host boot process and container startup, the reason containers start in milliseconds (vs. seconds or minutes for hosts) becomes clear:
+
+| Host Boot Task | Time | Container Equivalent | Time |
+|----------------|------|----------------------|------|
+| PSU stabilization | ~500ms | N/A (host already on) | 0 |
+| CPU reset, firmware | ~3-5s | N/A | 0 |
+| RAM training | ~1-5s | N/A (RAM already available) | 0 |
+| Hardware enumeration | ~1-2s | N/A (already done) | 0 |
+| Bootloader (GRUB) | ~1-2s | N/A (no kernel to load) | 0 |
+| Kernel decompression | ~1s | N/A (kernel already running) | 0 |
+| Kernel initialization | ~2-3s | N/A | 0 |
+| initramfs / root mount | ~1-2s | OverlayFS mount | ~5ms |
+| systemd startup | ~3-5s | clone() + namespace setup | ~10ms |
+| Service initialization | ~5-15s | exec() entrypoint | ~1ms |
+| **Total** | **~15-30s** | **Total** | **~50-500ms** |
+
+The container benefits from everything the host kernel has already done. It pays only for:
+1. Creating namespaces (kernel data structure allocation — microseconds)
+2. Setting up cgroups (writing a few files — microseconds)
+3. Mounting OverlayFS (directory operations — milliseconds)
+4. Creating a veth pair (kernel network operations — milliseconds)
+5. exec() of the entrypoint (loading one program — milliseconds)
+
+---
+
+## Host Boot vs Container Start — Full Comparison Table
+
+| Layer | Host Boot | Container Start |
+|-------|-----------|-----------------|
+| **Power** | PSU must stabilize, deliver voltages | N/A — host already powered |
+| **CPU** | Released from reset, starts in real mode | N/A — CPU already in long mode |
+| **Firmware** | BIOS/UEFI initializes hardware, trains RAM | N/A — hardware already initialized |
+| **Bootloader** | GRUB loads kernel + initramfs from disk | N/A — no kernel to load |
+| **Kernel** | Decompresses, initializes memory/interrupts/VFS | Shared — uses host's running kernel |
+| **Root filesystem discovery** | initramfs loads drivers, finds disk, mounts root | Runtime mounts overlay layers (instant) |
+| **Root filesystem type** | ext4/XFS/Btrfs on physical disk partition | OverlayFS over image layers on host FS |
+| **PID 1** | systemd (full init system) | Application process (nginx, python, etc.) |
+| **PID 1 responsibilities** | Manage all services, mounts, sessions, reaping | Run the application, handle signals |
+| **Process isolation** | Full OS boundary | Namespaces (pid, net, mnt, uts, ipc, user) |
+| **Resource limits** | Hardware limits only | cgroups (CPU, memory, I/O, PIDs) |
+| **Networking** | Physical NIC + full IP stack | Virtual NIC (veth) + NAT bridge |
+| **Storage** | Block devices + physical partitions | Overlay layers + volumes/bind mounts |
+| **Device access** | Full access to all hardware | Minimal /dev (null, zero, random, tty) |
+| `/proc` | Full view — all processes, all tunables | Scoped to PID namespace, some paths masked |
+| `/sys` | Full view — read/write | Read-only, restricted |
+| `/dev` | All device nodes via udev | Minimal pseudo-devices only |
+| **Kernel modules** | Loaded from initramfs and /lib/modules | N/A — uses host's loaded modules |
+| **Firmware/hardware config** | ACPI, UEFI variables, device setup | N/A |
+| **Time to ready** | 15–30 seconds (varies) | 50–500 milliseconds |
+| **Shutdown** | Orderly service stop, unmount, poweroff | Kill processes, remove namespaces/cgroups |
+| **Isolation level** | Hardware boundary (separate machine) | Kernel-enforced logical boundary |
+| **Kernel crash impact** | Only this machine affected | ALL containers on host affected |
+
+---
+
+## Unified Mental Model
+
+Here is the complete picture — from raw electricity to running workload — as one coherent model.
+
+```
+The Full Stack: Power → Operating System → Containers
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│   LAYER 0: ELECTRICITY                                                   │
+│   ┌────────────────────────────────────────────────────────────────┐     │
+│   │ Wall outlet → PSU → stable DC voltages → Power Good signal    │     │
+│   └────────────────────────────────────────────────────────────────┘     │
+│                              ↓                                           │
+│   LAYER 1: HARDWARE INITIALIZATION                                       │
+│   ┌────────────────────────────────────────────────────────────────┐     │
+│   │ CPU reset vector → Firmware (UEFI/BIOS) → RAM training →      │     │
+│   │ PCIe enumeration → device discovery                           │     │
+│   └────────────────────────────────────────────────────────────────┘     │
+│                              ↓                                           │
+│   LAYER 2: BOOTLOADER                                                    │
+│   ┌────────────────────────────────────────────────────────────────┐     │
+│   │ GRUB reads ESP/MBR → loads vmlinuz + initramfs into RAM →     │     │
+│   │ passes kernel command line → jumps to kernel entry point      │     │
+│   └────────────────────────────────────────────────────────────────┘     │
+│                              ↓                                           │
+│   LAYER 3: KERNEL                                                        │
+│   ┌────────────────────────────────────────────────────────────────┐     │
+│   │ Decompresses → sets up memory management, interrupts,         │     │
+│   │ scheduler, VFS → unpacks initramfs → runs /init →             │     │
+│   │ loads drivers → mounts real root → switch_root →              │     │
+│   │ exec /sbin/init (systemd)                                     │     │
+│   └────────────────────────────────────────────────────────────────┘     │
+│                              ↓                                           │
+│   LAYER 4: INIT SYSTEM (systemd)                                         │
+│   ┌────────────────────────────────────────────────────────────────┐     │
+│   │ Mounts filesystems → starts udev → starts journald →         │     │
+│   │ starts networking → starts services → reaches target          │     │
+│   └────────────────────────────────────────────────────────────────┘     │
+│                              ↓                                           │
+│   LAYER 5: USER SPACE                                                    │
+│   ┌────────────────────────────────────────────────────────────────┐     │
+│   │ Login prompts (tty/graphical) → user sessions →               │     │
+│   │ applications → container runtime (Docker/containerd)          │     │
+│   └────────────────────────────────────────────────────────────────┘     │
+│                              ↓                                           │
+│   LAYER 6: CONTAINERS (built on kernel primitives)                       │
+│   ┌────────────────────────────────────────────────────────────────┐     │
+│   │ clone() with namespace flags → cgroup creation →              │     │
+│   │ overlay mount → pivot_root → exec entrypoint                  │     │
+│   │                                                                │     │
+│   │  ┌─── Container A ───┐  ┌─── Container B ───┐                │     │
+│   │  │ PID ns │ NET ns    │  │ PID ns │ NET ns    │                │     │
+│   │  │ MNT ns │ UTS ns    │  │ MNT ns │ UTS ns    │                │     │
+│   │  │ IPC ns │ USER ns   │  │ IPC ns │ USER ns   │                │     │
+│   │  │                    │  │                    │                │     │
+│   │  │ cgroup limits:     │  │ cgroup limits:     │                │     │
+│   │  │ CPU: 50%           │  │ CPU: 25%           │                │     │
+│   │  │ MEM: 512 MB        │  │ MEM: 1 GB          │                │     │
+│   │  │                    │  │                    │                │     │
+│   │  │ rootfs: overlay    │  │ rootfs: overlay    │                │     │
+│   │  │ PID 1: nginx       │  │ PID 1: postgres    │                │     │
+│   │  └────────────────────┘  └────────────────────┘                │     │
+│   └────────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│   All containers share: the host kernel, physical hardware, and          │
+│   kernel-managed resources (CPU time, RAM pages, network stack,          │
+│   filesystem drivers, block device drivers). Namespaces create           │
+│   the illusion of independence. cgroups enforce the boundaries.          │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### The Key Insight
+
+The entire boot process is a **chain of trust and delegation**:
+
+1. **Electricity** enables hardware
+2. **Hardware** runs firmware
+3. **Firmware** finds and loads the bootloader
+4. **Bootloader** finds and loads the kernel
+5. **Kernel** provides a controlled environment for processes
+6. **Init system (PID 1)** manages services and system state
+7. **Container runtime** uses kernel primitives (namespaces + cgroups) to create isolated environments
+8. **Container processes** run as regular processes on the host kernel, unaware of each other
+
+Each layer depends entirely on the layers below it. A failure at any layer cascades upward — firmware failure means no boot, kernel panic means no containers, and a container crash is isolated (only that container is affected, because the kernel protects everything else).
+
+A container does not replace any of these layers — it sits on top of all of them, benefiting from the work that every prior layer has already done. That accumulated foundation is why `docker run` takes 200 milliseconds while a bare-metal boot takes 20 seconds: the container simply skips the first 99% of the journey because the host already made it.

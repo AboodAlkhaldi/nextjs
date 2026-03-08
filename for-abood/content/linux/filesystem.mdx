@@ -1,0 +1,2754 @@
+---
+sidebarTitle: Filesystem
+---
+
+# Linux Filesystem Hierarchy: Deep Technical Reference
+
+---
+
+## Table of Contents
+
+1. [Virtual Filesystem Switch (VFS)](#virtual-filesystem-switch-vfs)
+2. [Mounting Concepts](#mounting-concepts)
+3. [Inodes, Dentries, and Superblocks](#inodes-dentries-and-superblocks)
+4. [Disk-Backed vs Virtual Filesystems](#disk-backed-vs-virtual-filesystems)
+5. [Syscalls and Filesystem Paths](#syscalls-and-filesystem-paths)
+6. [Filesystem Hierarchy Reference](#filesystem-hierarchy-reference)
+   - [`/` (Root)](#-root)
+   - [`/bin`](#bin)
+   - [`/sbin`](#sbin)
+   - [`/boot`](#boot)
+   - [`/dev`](#dev)
+   - [`/etc`](#etc)
+   - [`/home`](#home)
+   - [`/lib` and `/lib64`](#lib-and-lib64)
+   - [`/media`](#media)
+   - [`/mnt`](#mnt)
+   - [`/opt`](#opt)
+   - [`/proc`](#proc)
+   - [`/run`](#run)
+   - [`/srv`](#srv)
+   - [`/sys`](#sys)
+   - [`/tmp`](#tmp)
+   - [`/usr`](#usr)
+   - [`/var`](#var)
+7. [Cross-Cutting Topics](#cross-cutting-topics)
+   - [systemd Unit File Locations](#systemd-unit-file-locations)
+   - [cgroups v1 vs v2 Path Differences](#cgroups-v1-vs-v2-path-differences)
+   - [tmpfs Mounts and Ephemeral Runtime Storage](#tmpfs-mounts-and-ephemeral-runtime-storage)
+   - [Traditional vs Merged-/usr Systems](#traditional-vs-merged-usr-systems)
+   - [Package Manager Interaction](#package-manager-interaction)
+   - [`/etc/fstab` Deep Explanation](#etcfstab-deep-explanation)
+   - [Mount Namespaces and chroot](#mount-namespaces-and-chroot)
+
+---
+
+## Virtual Filesystem Switch (VFS)
+
+The Virtual Filesystem Switch (VFS) is an abstraction layer inside the Linux kernel that provides a uniform interface to userspace for all filesystem operations, regardless of the underlying filesystem type. Every `open()`, `read()`, `write()`, `stat()`, and `readdir()` call passes through VFS before reaching the actual filesystem implementation.
+
+### Architecture
+
+VFS sits between the system call interface and the concrete filesystem drivers. The kernel maintains a set of function pointer tables (operations structs) that each filesystem registers:
+
+```
+Userspace:      open("/etc/hostname", O_RDONLY)
+                       |
+                  syscall interface
+                       |
+Kernel VFS:     path lookup (namei) -> dentry cache -> inode
+                       |
+                  file_operations / inode_operations
+                       |
+Filesystem:     ext4 / xfs / btrfs / proc / sysfs / tmpfs / overlayfs
+                       |
+Block layer:    bio / request queue (for disk-backed fs only)
+                       |
+Hardware:       NVMe / SCSI / virtio-blk
+```
+
+### How the Kernel Exposes Filesystems
+
+When the kernel boots, the root filesystem is mounted at `/`. Additional filesystems are mounted at mount points (directories) within the existing tree. Each mount associates a filesystem instance with a directory path.
+
+The kernel exposes filesystem types through `/proc/filesystems`, listing both built-in and module-loaded filesystem drivers. Filesystems marked `nodev` do not require a backing block device (virtual filesystems like `proc`, `sysfs`, `tmpfs`).
+
+A filesystem driver registers itself with the kernel via `register_filesystem()`, providing a `file_system_type` struct. When a mount is requested, the kernel calls the filesystem's `mount()` (or legacy `get_sb()`) function to create a superblock, the root inode, and the root dentry.
+
+### Key VFS Objects
+
+| Object | Role |
+|--------|------|
+| `superblock` | Represents a mounted filesystem instance. Contains metadata about the filesystem (block size, state, operations). |
+| `inode` | Represents a single filesystem object (file, directory, symlink, device node). Contains metadata (permissions, timestamps, size, pointers to data). Does NOT contain the filename. |
+| `dentry` | Represents a directory entry: the association between a name and an inode. Cached aggressively in the dentry cache (dcache) for path lookup performance. |
+| `file` | Represents an open file descriptor. Created by `open()`. Points to a dentry/inode. Tracks per-open state (offset, access mode, flags). |
+
+### Path Resolution (namei)
+
+When userspace calls `open("/etc/hostname", ...)`, VFS resolves the path component by component:
+
+1. Start at the root dentry of the process's mount namespace (or at `cwd` for relative paths).
+2. Look up `etc` in the dcache. On miss, call the parent inode's `lookup()` operation.
+3. Check if `etc` is a mount point. If so, cross into the mounted filesystem's root dentry.
+4. Look up `hostname` within the `etc` dentry.
+5. Perform permission checks at each step (`inode->i_op->permission()`).
+6. Return the final dentry/inode pair.
+
+This path walk is called `namei` (name-to-inode), and its performance is critical: the dcache avoids hitting the underlying filesystem for every lookup.
+
+---
+
+## Mounting Concepts
+
+A **mount** binds a filesystem instance to a directory in the existing namespace tree. The mount point directory's original contents become hidden (shadowed) while the mount is active.
+
+### Mount Types
+
+| Type | Description |
+|------|-------------|
+| Block device mount | Filesystem backed by a block device (`mount /dev/sda1 /mnt`) |
+| Bind mount | Re-exposes an existing subtree at another location (`mount --bind /src /dst`) |
+| Loop mount | Filesystem inside a file, via a loop device (`mount -o loop image.iso /mnt`) |
+| tmpfs mount | RAM-backed filesystem (`mount -t tmpfs tmpfs /tmp`) |
+| Overlay mount | Union filesystem layering multiple directories (`mount -t overlay ...`) |
+| Network mount | NFS, CIFS, etc. |
+| Pseudo/virtual mount | Kernel-generated filesystems (`proc`, `sysfs`, `devtmpfs`, `cgroup`) |
+
+### Mount Propagation
+
+Mounts can propagate between mount namespaces. Propagation types:
+
+- **shared**: Mounts/unmounts propagate bidirectionally between peer groups.
+- **slave**: Receives propagation from a master but does not send.
+- **private**: No propagation (default for new mounts).
+- **unbindable**: Cannot be bind-mounted.
+
+This is critical in container runtimes: Kubernetes and Docker configure mount propagation to control whether host mounts are visible inside containers. The `mountPropagation` field in Kubernetes pod specs maps directly to these kernel semantics.
+
+### Mount Table
+
+Active mounts are visible in:
+
+- `/proc/self/mounts` (or `/proc/<pid>/mounts`) -- per-process mount view
+- `/proc/self/mountinfo` -- extended format with mount IDs, parent IDs, propagation info
+- `findmnt` -- tree-formatted view
+- `/etc/mtab` -- traditionally a file, now typically a symlink to `/proc/self/mounts`
+
+---
+
+## Inodes, Dentries, and Superblocks
+
+### Inodes
+
+An inode is the kernel's in-memory (and on-disk, for disk-backed filesystems) representation of a filesystem object. Key fields:
+
+- `i_mode`: file type + permission bits (16-bit field: 4 bits type, 12 bits permissions including suid/sgid/sticky)
+- `i_uid`, `i_gid`: owner and group
+- `i_size`: file size in bytes
+- `i_nlink`: hard link count (when it drops to 0 and no open file descriptors remain, the inode is freed)
+- `i_atime`, `i_mtime`, `i_ctime`: access, modification, change timestamps
+- `i_blocks`: number of 512-byte blocks allocated
+- `i_op`: pointer to `inode_operations` (lookup, create, link, unlink, mkdir, rename, etc.)
+- `i_fop`: pointer to `file_operations` (read, write, llseek, ioctl, mmap, etc.)
+
+Inodes are identified by number within a filesystem. The same inode number can exist on different filesystems; uniqueness requires `(device, inode)` pairs.
+
+For virtual filesystems (`procfs`, `sysfs`), inodes are generated dynamically and do not exist on disk.
+
+### Dentries
+
+A dentry (directory entry) maps a filename component to an inode. The dentry cache (dcache) is one of the most performance-critical caches in the kernel. Dentries exist in three states:
+
+- **in-use**: associated with a valid inode, reference count > 0
+- **unused**: valid but reference count = 0 (cached for future lookups)
+- **negative**: no corresponding inode found (caches "file does not exist" results to avoid repeated disk lookups)
+
+### Superblocks
+
+Each mounted filesystem instance has a superblock. It stores:
+
+- Filesystem type and block size
+- Filesystem state (clean, dirty, errors)
+- Root inode reference
+- Operations struct (`super_operations`: `alloc_inode`, `write_inode`, `sync_fs`, `put_super`, etc.)
+- Mount flags (read-only, noexec, nosuid, etc.)
+
+For ext4, the superblock is stored at byte offset 1024 on the block device, with backup copies at specific block group boundaries. For virtual filesystems, the superblock exists only in memory.
+
+---
+
+## Disk-Backed vs Virtual Filesystems
+
+### Disk-Backed Filesystems
+
+These store data persistently on block devices. Data survives reboots. Examples: ext4, xfs, btrfs, f2fs, vfat.
+
+Characteristics:
+- Backed by a block device (real or virtual: `/dev/sda1`, `/dev/nvme0n1p2`, `/dev/mapper/vg-lv`)
+- Have on-disk format specifications (superblock layout, inode tables, extent trees)
+- Subject to fsck / repair tools
+- Journal or CoW mechanisms for crash consistency
+- Performance depends on I/O scheduler, device speed, filesystem tuning
+
+### Virtual (Pseudo) Filesystems
+
+These do not store data on a block device. Data is generated on-the-fly by the kernel or exists only in RAM. Examples: `procfs`, `sysfs`, `devtmpfs`, `tmpfs`, `cgroup`, `configfs`, `debugfs`, `securityfs`.
+
+Characteristics:
+- Mounted with `-t <type>` and no block device (or `none` as source)
+- Data is ephemeral (lost on reboot or unmount)
+- Reads and writes translate to kernel function calls, not disk I/O
+- File sizes reported as 0 for many pseudo-files (even though reading them produces content)
+- Cannot be fscked
+- Critical for kernel/userspace communication
+
+### Hybrid: tmpfs
+
+`tmpfs` is RAM-backed but can be swapped to disk under memory pressure. It has a standard VFS interface (create files, directories, symlinks) but no backing block device. Used for `/run`, `/tmp`, `/dev/shm`, and container writable layers.
+
+---
+
+## Syscalls and Filesystem Paths
+
+Every file path operation in Linux ultimately resolves to one or more system calls. The kernel's VFS layer translates paths to operations on inodes.
+
+| Operation | Syscall(s) | VFS path |
+|-----------|-----------|----------|
+| Open a file | `open()`, `openat()` | Path walk -> dentry lookup -> `inode->i_fop->open()` |
+| Read a file | `read()`, `pread64()` | `file->f_op->read()` or `read_iter()` |
+| Write a file | `write()`, `pwrite64()` | `file->f_op->write()` or `write_iter()` |
+| Get file metadata | `stat()`, `fstat()`, `lstat()` | Path walk -> `inode->i_op->getattr()` |
+| List directory | `getdents64()` | `file->f_op->iterate_shared()` |
+| Create file | `creat()`, `open(O_CREAT)` | `dir_inode->i_op->create()` |
+| Create directory | `mkdir()` | `dir_inode->i_op->mkdir()` |
+| Delete file | `unlink()` | `dir_inode->i_op->unlink()` |
+| Mount | `mount()` | Kernel mount infrastructure |
+| Change root | `chroot()`, `pivot_root()` | Modifies process's root dentry reference |
+
+The relationship between paths and syscalls matters operationally: `strace` reveals which paths a process touches, and understanding the underlying syscalls helps diagnose permission errors, mount visibility issues, and container breakouts.
+
+---
+
+## Filesystem Hierarchy Reference
+
+---
+
+### `/` (Root)
+
+**Purpose and Design Intent**
+
+The root directory is the apex of the entire filesystem hierarchy. Every file and directory on the system is reachable from `/`. The root filesystem must contain enough to boot, mount other filesystems, and recover the system. Historically, it was kept minimal so it could reside on a small, reliable partition.
+
+**What Type of Data Lives Here**
+
+The root directory itself contains only mount points and top-level directories. No regular files should live directly in `/` (though `initrd` remnants sometimes appear). The root filesystem is typically disk-backed (ext4, xfs) and persistent.
+
+**Cloud / Container / Kubernetes Relevance**
+
+In containers, `/` is the root of the container's overlay filesystem. `pivot_root()` or `chroot()` is used during container startup to make the container image's root the process's filesystem root. The container's root is typically an OverlayFS mount with a read-only lower layer (image) and a read-write upper layer (container-specific changes).
+
+In Kubernetes, the node's root filesystem is largely invisible to pods. The container runtime constructs an isolated filesystem tree for each container. Volumes are bind-mounted into the container's filesystem.
+
+---
+
+### `/bin`
+
+**DIRECTORY: /bin**
+
+#### Purpose and Design Intent
+
+`/bin` holds essential user command binaries required for single-user mode and basic system operation. These are the minimum commands needed when no other filesystems are mounted. Historically, `/bin` was on the root partition, while `/usr/bin` might be on a separate (potentially NFS-mounted) partition.
+
+In merged-`/usr` systems (modern Fedora, Ubuntu 20.04+, Debian 12+, Arch), `/bin` is a symlink to `/usr/bin`. The separation is maintained only for backward compatibility of path references.
+
+#### What Type of Data Lives Here
+
+- Static ELF binaries (compiled executables)
+- Persistent across reboots
+- Owned by the package manager
+- Should not be modified by hand
+
+#### Typical Subdirectories
+
+`/bin` is flat; it does not contain subdirectories.
+
+```
+/bin/
+├── bash
+├── cat
+├── cp
+├── dd
+├── grep
+├── ip
+├── kill
+├── ln
+├── ls
+├── mkdir
+├── mount
+├── mv
+├── ps
+├── rm
+├── sh -> bash (or dash)
+├── systemctl
+├── tar
+├── umount
+└── uname
+```
+
+#### Real File Examples
+
+**`/bin/bash`**
+The Bourne Again Shell. Default interactive shell on most distributions. Statically or dynamically linked depending on distro. This is the interpreter for `#!/bin/bash` scripts. If missing, interactive login is impossible for users whose shell is set to `/bin/bash` in `/etc/passwd`.
+
+**`/bin/mount`**
+Mounts filesystems. Suid-root on some distributions (to allow user mounts defined in `/etc/fstab`). Calls the `mount(2)` syscall. In containers, this binary is present but `mount(2)` is typically blocked by seccomp or lacks `CAP_SYS_ADMIN`.
+
+**`/bin/ip`**
+Iproute2 utility for network interface, route, and address management. Replaces legacy `ifconfig`, `route`, `arp`. Used heavily in container networking (`ip link`, `ip netns`).
+
+**`/bin/ps`**
+Reads `/proc` to list running processes. Output depends entirely on the procfs mount being available. In minimal containers, `ps` may be absent.
+
+**`/bin/sh`**
+POSIX-compatible shell. On Debian/Ubuntu, this is a symlink to `dash` (lightweight). On RHEL/Fedora, it points to `bash`. Scripts using `#!/bin/sh` should restrict themselves to POSIX syntax for portability.
+
+#### How to Inspect and Investigate
+
+```bash
+# Show file type and linking
+file /bin/bash
+# Output: /bin/bash: ELF 64-bit LSB pie executable, x86-64, dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, stripped
+
+file /bin/sh
+# Output: /bin/sh: symbolic link to dash
+```
+
+```bash
+# Check if /bin is a symlink (merged-/usr detection)
+ls -ld /bin
+# Merged-usr output:   lrwxrwxrwx 1 root root 7 Jan 1 00:00 /bin -> usr/bin
+# Traditional output:  drwxr-xr-x 2 root root 4096 Jan 1 00:00 /bin
+```
+
+```bash
+# List shared library dependencies of a binary
+ldd /bin/ls
+
+# Check which package owns a binary (Debian)
+dpkg -S /bin/ls
+# Output: coreutils: /bin/ls
+
+# Check which package owns a binary (RHEL)
+rpm -qf /bin/ls
+# Output: coreutils-8.32-34.el9.x86_64
+```
+
+**Debugging**: If a binary in `/bin` is missing or corrupt, single-user mode may be unreachable. Check the package manager database for integrity. On Debian: `dpkg --verify coreutils`. On RHEL: `rpm -V coreutils`.
+
+#### Permission Patterns
+
+All binaries in `/bin` are owned by `root:root` with mode `0755`. Exceptions:
+
+- `mount`, `umount`, `su`, `ping` may be suid-root (`4755`) on traditional systems. Modern systems prefer capabilities (`cap_net_raw` for `ping`) or remove suid entirely.
+
+#### Security Considerations
+
+- Suid binaries here are high-value attack targets. Audit with `find /bin -perm -4000`.
+- In SELinux environments, binaries are labeled with types like `bin_t` or `shell_exec_t`. Mislabeling prevents execution from enforcing domains.
+- AppArmor profiles reference these paths directly; renaming breaks confinement.
+- Container images should minimize binaries in `/bin` to reduce attack surface.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- In distroless or scratch-based container images, `/bin` may be empty or absent entirely.
+- The shell (`/bin/sh`) is required for Kubernetes `exec` probes and `kubectl exec`. Its absence breaks debugging workflows.
+- OverlayFS presents a merged view of `/bin` from the image layer. Writes create copies in the upper (writable) layer.
+- Alpine-based images use BusyBox: `/bin/ls`, `/bin/cat`, etc. are all symlinks to `/bin/busybox`.
+
+#### Common Misconceptions
+
+- **"/bin and /usr/bin are different directories with different purposes."** On merged-`/usr` systems, they are the same directory. The distinction is purely historical.
+- **"I should install custom scripts in /bin."** No. `/bin` is managed by the distribution's package manager. Use `/usr/local/bin` for locally-installed software or `/opt/<pkg>/bin` for third-party software.
+
+---
+
+### `/sbin`
+
+**DIRECTORY: /sbin**
+
+#### Purpose and Design Intent
+
+`/sbin` holds essential system binaries intended for the system administrator. These commands are needed for booting, recovery, and repairing the system. On traditional systems, `/sbin` was not in the default `$PATH` for non-root users, restricting casual access to administrative tools.
+
+On merged-`/usr` systems, `/sbin` is a symlink to `/usr/sbin` (which itself may symlink to `/usr/bin` on fully merged systems like Arch and Fedora).
+
+#### What Type of Data Lives Here
+
+- Static ELF binaries for system administration
+- Filesystem tools, bootloader tools, network configuration daemons
+- Owned by the package manager
+
+#### Typical Subdirectories
+
+`/sbin` is flat.
+
+```
+/sbin/
+├── fdisk
+├── fsck
+├── fsck.ext4
+├── halt
+├── ifconfig        (legacy, may be absent)
+├── init -> ../lib/systemd/systemd
+├── iptables
+├── mkfs
+├── mkfs.ext4
+├── modprobe
+├── reboot
+├── shutdown
+├── sysctl
+└── tune2fs
+```
+
+#### Real File Examples
+
+**`/sbin/init`**
+PID 1. On systemd systems, this is a symlink to `/lib/systemd/systemd` (or `/usr/lib/systemd/systemd`). The kernel exec's this path after mounting the root filesystem. If it is missing or broken, the system panics at boot with "No init found."
+
+**`/sbin/fsck`**
+Filesystem consistency checker front-end. Dispatches to filesystem-specific tools (`fsck.ext4`, `fsck.xfs`). Runs at boot on unclean filesystems if configured in `/etc/fstab` (sixth field). On journal-based filesystems, replay is typically sufficient and full fsck is rare.
+
+**`/sbin/iptables`**
+Netfilter firewall management. On modern systems, may be a compatibility wrapper around `nft` (nftables). Kubernetes `kube-proxy` in iptables mode writes extensive rulesets here. Understanding this binary's behavior is essential for debugging Kubernetes service routing.
+
+**`/sbin/modprobe`**
+Loads kernel modules from `/lib/modules/$(uname -r)/`. Reads module dependencies from `modules.dep`. Used by udev, systemd, and manual loading. In containers, module loading is typically forbidden (no `CAP_SYS_MODULE`).
+
+#### How to Inspect and Investigate
+
+```bash
+# See what /sbin/init points to
+readlink -f /sbin/init
+# Output: /usr/lib/systemd/systemd
+
+ls -la /sbin/init
+# Output: lrwxrwxrwx 1 root root 20 Jan 1 00:00 /sbin/init -> /lib/systemd/systemd
+```
+
+```bash
+# Verify a system binary's integrity (RHEL)
+rpm -Vf /sbin/fsck
+
+# List all suid binaries in /sbin
+find /sbin -perm -4000 -ls
+```
+
+#### Permission Patterns
+
+Mode `0755`, owned by `root:root`. Some tools like `unix_chkpwd` may be suid-root.
+
+#### Security Considerations
+
+- `/sbin` tools can modify disk layout, network config, and kernel parameters. Container runtimes drop the capabilities required to use most of them.
+- SELinux types: `fsadm_exec_t`, `iptables_exec_t`, etc.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- Minimal container images often exclude `/sbin` entirely.
+- `iptables` in `/sbin` is critical on Kubernetes nodes for `kube-proxy` iptables mode. The node must have a compatible `iptables` binary.
+- Init systems in containers (tini, dumb-init) may be placed at `/sbin/init` in custom images to handle PID 1 responsibilities (signal forwarding, zombie reaping).
+
+#### Common Misconceptions
+
+- **"Regular users cannot run /sbin commands."** On modern systems with merged-`/usr`, `/sbin` is in `$PATH` for all users. The commands still require root privileges to perform their operations, but they can be invoked (and will return "permission denied" or similar errors).
+
+---
+
+### `/boot`
+
+**DIRECTORY: /boot**
+
+#### Purpose and Design Intent
+
+`/boot` contains the files required to boot the system: kernel images, initial ramdisk (initrd/initramfs), and bootloader configuration. Historically, `/boot` was a small partition (< 500MB) at the beginning of the disk because older BIOS firmware could only read from the first 1024 cylinders.
+
+On UEFI systems, `/boot/efi` is the EFI System Partition (ESP), formatted as FAT32.
+
+#### What Type of Data Lives Here
+
+- Binary kernel images (static, large)
+- Initramfs archives (compressed cpio)
+- Bootloader configuration (text)
+- System.map (kernel symbol table, debugging)
+- Persistent across reboots, updated on kernel upgrades
+
+#### Typical Subdirectories
+
+```
+/boot/
+├── config-5.15.0-91-generic        kernel build config
+├── efi/                             EFI System Partition mount
+│   └── EFI/
+│       ├── BOOT/
+│       │   └── BOOTX64.EFI
+│       ├── ubuntu/
+│       │   ├── grubx64.efi
+│       │   └── shimx64.efi
+│       └── fedora/
+│           └── shimx64.efi
+├── grub/                            GRUB bootloader
+│   ├── grub.cfg                     generated config (do not edit directly)
+│   ├── grubenv                      persistent GRUB variables
+│   └── fonts/
+├── initrd.img-5.15.0-91-generic     initial ramdisk
+├── System.map-5.15.0-91-generic     kernel symbol-to-address map
+└── vmlinuz-5.15.0-91-generic        compressed kernel image
+```
+
+#### Real File Examples
+
+**`/boot/vmlinuz-5.15.0-91-generic`**
+The compressed Linux kernel image. Name derives from "Virtual Memory LINUx gZipped." The bootloader loads this into memory and transfers execution to it. Multiple versions coexist after kernel upgrades; old ones are removed by `apt autoremove` or `dnf autoremove`.
+
+**`/boot/initrd.img-5.15.0-91-generic`**
+The initial ramdisk. A compressed cpio archive containing a minimal root filesystem loaded into RAM by the bootloader. Contains kernel modules needed to mount the real root filesystem (disk drivers, filesystem drivers, LVM/LUKS tools). Generated by `update-initramfs` (Debian) or `dracut` (RHEL/Fedora).
+
+**`/boot/grub/grub.cfg`**
+Generated GRUB2 configuration. Defines menu entries, kernel parameters, module loading. Generated by `grub-mkconfig` (or `grub2-mkconfig` on RHEL). Source configuration lives in `/etc/default/grub` and `/etc/grub.d/`.
+
+**`/boot/System.map-5.15.0-91-generic`**
+Maps kernel symbol names to memory addresses. Used by debugging tools (`klogd`, `ksymoops`, perf). Not required for normal operation but essential for kernel crash analysis.
+
+#### How to Inspect and Investigate
+
+```bash
+# List boot files with sizes
+ls -lh /boot/
+# Check which kernel is currently running
+uname -r
+# Output: 5.15.0-91-generic
+```
+
+```bash
+# Inspect initramfs contents
+lsinitramfs /boot/initrd.img-$(uname -r) | head -20
+# Or on RHEL:
+lsinitrd /boot/initramfs-$(uname -r).img | head -20
+
+# Check disk usage of /boot
+df -h /boot
+```
+
+**Debugging**: If `/boot` fills up (common on Ubuntu with automatic kernel upgrades), the system cannot install new kernels. Check with `df -h /boot`. Remove old kernels with `apt autoremove` or `dnf autoremove`.
+
+#### Permission Patterns
+
+- Files owned by `root:root`, mode `0600` or `0644`.
+- `System.map` should be `0600` to prevent address leakage (KASLR bypass).
+- `/boot` directory itself is `0755`.
+
+#### Security Considerations
+
+- An attacker with write access to `/boot` can replace the kernel or initramfs, achieving persistent root-level compromise that survives reboots.
+- Secure Boot (UEFI) mitigates this by requiring signed bootloader and kernel binaries. The `shimx64.efi` chainloads a signed GRUB, which loads a signed kernel.
+- LUKS full-disk encryption does not protect `/boot` (it must be readable before decryption). Separate solutions exist (GRUB with LUKS2 support, encrypted `/boot`).
+- SELinux label: `boot_t`.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- Containers do not have `/boot`. The kernel is provided by the host.
+- On cloud VMs, `/boot` is managed by the AMI/image builder. Kernel upgrades on cloud VMs require image rebuilding or in-place package updates followed by reboot.
+- Kubernetes nodes require kernel versions compatible with the container runtime and CNI plugin. The kernel in `/boot` determines available features (cgroups v2, eBPF, WireGuard).
+- Some managed Kubernetes services (EKS, GKE, AKS) do not expose `/boot` to the operator at all.
+
+#### Common Misconceptions
+
+- **"I should edit grub.cfg directly."** No. It is generated. Edit `/etc/default/grub` for kernel parameters, then run `update-grub` (Debian) or `grub2-mkconfig -o /boot/grub2/grub.cfg` (RHEL).
+- **"/boot must be a separate partition."** Not required on modern systems with GPT/UEFI and filesystems GRUB can read (ext4, btrfs). But `/boot/efi` (the ESP) must be FAT32 and is typically a separate partition.
+
+---
+
+### `/dev`
+
+**DIRECTORY: /dev**
+
+#### Purpose and Design Intent
+
+`/dev` contains device nodes -- special files that provide an interface to device drivers in the kernel. The Unix philosophy "everything is a file" is realized most directly here. Character devices, block devices, and pseudo-devices all appear as files with major and minor numbers identifying the kernel driver and specific device instance.
+
+Historically, `/dev` was populated statically with `mknod`. Modern systems use `devtmpfs` (a kernel-managed tmpfs) plus `udev` (or `systemd-udevd`) for dynamic device node management.
+
+#### What Type of Data Lives Here
+
+- Character device nodes (byte-stream devices: terminals, serial ports, `/dev/null`)
+- Block device nodes (block-addressable devices: disks, partitions)
+- Symlinks created by udev rules (e.g., `/dev/disk/by-uuid/...`)
+- Named pipes and sockets (rare, mostly in `/dev/log`)
+- Pseudo-terminal devices
+- Runtime, ephemeral (devtmpfs is in-memory)
+
+#### Typical Subdirectories
+
+```
+/dev/
+├── block/                     symlinks to block devices by major:minor
+├── bus/
+│   └── usb/                   USB device nodes
+├── char/                      symlinks to char devices by major:minor
+├── disk/
+│   ├── by-id/                 persistent disk symlinks by hardware ID
+│   ├── by-label/              symlinks by filesystem label
+│   ├── by-partlabel/         symlinks by GPT partition label
+│   ├── by-partuuid/          symlinks by GPT partition UUID
+│   ├── by-path/              symlinks by hardware path
+│   └── by-uuid/              symlinks by filesystem UUID
+├── dri/                       Direct Rendering (GPU) devices
+├── fd -> /proc/self/fd        file descriptor symlinks
+├── hugepages/                 hugetlbfs mount
+├── input/                     input devices (keyboards, mice)
+├── mapper/                    device-mapper devices (LVM)
+├── mqueue/                    POSIX message queues
+├── net/
+│   └── tun                    TUN/TAP device
+├── pts/                       pseudo-terminal slave devices
+├── shm/                       POSIX shared memory (tmpfs)
+├── null                       data sink
+├── zero                       infinite zero bytes source
+├── random                     blocking entropy source (legacy)
+├── urandom                    non-blocking entropy source
+├── full                       always-full device (writes fail with ENOSPC)
+├── console                    system console
+├── tty                        current terminal
+├── sda                        first SCSI/SATA disk
+├── sda1                       first partition on sda
+├── nvme0n1                    first NVMe device
+├── nvme0n1p1                  first partition on nvme0n1
+├── loop0                      first loop device
+├── vda                        first virtio disk (common in VMs)
+└── stderr -> /proc/self/fd/2
+```
+
+#### Real File Examples
+
+**`/dev/null`**
+Character device (1, 3). Discards all writes, returns EOF on read. Used universally for suppressing output (`> /dev/null 2>&1`). If missing, many system services fail to start. Containers must provide this device.
+
+**`/dev/sda` / `/dev/nvme0n1`**
+Block devices representing entire physical disks. Reads/writes go directly to the disk's block layer. `sda` follows SCSI naming (also used for SATA, USB, and virtio-scsi). `nvme0n1` uses NVMe naming. Partition nodes (`sda1`, `nvme0n1p1`) represent individual partitions.
+
+**`/dev/pts/0`**
+A pseudo-terminal slave. Created when a terminal emulator or SSH session opens a PTY. The master side is an fd in the process that opened `/dev/ptmx`. The slave appears here, numbered sequentially. `tty` command reveals which PTY the current shell is using.
+
+**`/dev/shm`**
+A tmpfs mount point for POSIX shared memory (`shm_open(3)`). Default size is 50% of physical RAM. Used by databases (PostgreSQL), browsers, and IPC-heavy applications. In Docker, default `/dev/shm` size is 64MB, which is insufficient for many workloads (override with `--shm-size`).
+
+**`/dev/mapper/vg0-root`**
+A device-mapper device representing an LVM logical volume. Created by LVM userspace tools. The kernel's device-mapper subsystem provides block device abstraction over physical volumes, supporting striping, mirroring, snapshots, and thin provisioning.
+
+**`/dev/disk/by-uuid/a1b2c3d4-...`**
+A symlink to the actual device node (e.g., `../../sda1`). Created by udev rules that read filesystem UUIDs. These stable names are preferred in `/etc/fstab` because they don't change when disk ordering changes (unlike `/dev/sda` which depends on probe order).
+
+#### How to Inspect and Investigate
+
+```bash
+# Show device type and major/minor numbers
+ls -la /dev/null
+# Output: crw-rw-rw- 1 root root 1, 3 Jan 1 00:00 /dev/null
+# 'c' = character device, major 1 (mem driver), minor 3 (null)
+
+stat /dev/sda
+# Shows block device with major 8, minor 0
+```
+
+```bash
+# List block devices with hierarchy, sizes, and mount points
+lsblk -f
+# Shows NAME, FSTYPE, LABEL, UUID, MOUNTPOINTS
+
+# Trace symlinks in /dev/disk/by-uuid
+ls -la /dev/disk/by-uuid/
+```
+
+```bash
+# Identify which udev rules created a device/symlink
+udevadm info --query=all --name=/dev/sda
+
+# Monitor real-time device events
+udevadm monitor
+```
+
+```bash
+# List all open device files
+lsof /dev/sda
+
+# Check device mapper status
+dmsetup ls
+dmsetup info /dev/mapper/vg0-root
+```
+
+**Debugging**:
+- Missing device nodes: Check `dmesg` for driver errors, `udevadm trigger` to re-run rules.
+- Permission denied on `/dev/kvm`: User not in `kvm` group.
+- `/dev/shm` too small in container: Override with `--shm-size` or mount a larger tmpfs.
+
+#### Permission Patterns
+
+- `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`: `0666` (world-readable/writable), owned by `root:root`.
+- Disk devices (`/dev/sda`): `0660`, owned by `root:disk`.
+- TTY devices: `0620`, owned by the logged-in user, group `tty`.
+- GPU devices (`/dev/dri/card0`): `0660`, owned by `root:video` or `root:render`.
+
+#### Security Considerations
+
+- Direct access to block devices (`/dev/sda`) bypasses filesystem permissions entirely. Limit access to `root` and the `disk` group.
+- `/dev/mem` and `/dev/kmem` provide raw access to physical and kernel memory. Most modern kernels restrict these with `CONFIG_STRICT_DEVMEM`.
+- In containers, only a whitelist of devices is exposed (null, zero, full, random, urandom, tty, ptmx). Access to host devices requires explicit `--device` flags or `privileged` mode.
+- SELinux labels device nodes with types like `null_device_t`, `fixed_disk_device_t`. The `container_t` domain is not allowed access to most device types.
+- cgroup v1 device controller and cgroup v2 device filter (eBPF) restrict which devices a container can access by major:minor number.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- Containers receive a minimal `/dev` populated by the container runtime. `devtmpfs` is NOT mounted inside the container; instead, a fresh tmpfs is created and specific device nodes are bind-mounted or created.
+- Kubernetes `hostPath` volumes can expose host `/dev` entries to pods, but this is a serious security risk.
+- `/dev/shm` inside a pod defaults to 64MB (Docker) or medium-sized (containerd). Override with `emptyDir` volume with `medium: Memory`.
+- GPU workloads require `/dev/nvidia*` devices, managed by the NVIDIA device plugin in Kubernetes.
+- Block storage (EBS, Persistent Disk, Azure Disk) appears as `/dev/nvme*` or `/dev/sd*` on the node. The CSI driver handles attach/mount.
+
+#### Common Misconceptions
+
+- **"/dev/random is more secure than /dev/urandom."** Since Linux 4.8, both use the same CSPRNG after initialization. `/dev/urandom` is preferred for all purposes. `/dev/random` may block on older kernels waiting for entropy, causing hangs in VMs and containers.
+- **"Device nodes are regular files."** They are special files (character or block). `ls -l` shows `c` or `b` as the first character. They have major/minor numbers instead of file sizes.
+- **"I can just mknod to create any device."** The device node is just a name; the kernel must have a driver registered for the corresponding major/minor numbers. Creating a device node without a driver does nothing useful.
+
+---
+
+### `/etc`
+
+**DIRECTORY: /etc**
+
+#### Purpose and Design Intent
+
+`/etc` ("et cetera" or "Editable Text Configuration") holds system-wide configuration files. It is the primary location for host-specific configuration that varies between machines. The FHS mandates that `/etc` contains only static configuration files -- no binaries.
+
+The name dates to early Unix where `/etc` was a catch-all. Over time, its role was narrowed to configuration.
+
+#### What Type of Data Lives Here
+
+- Text-based configuration files
+- Static (does not change at runtime, except when an administrator edits them)
+- Persistent across reboots
+- Host-specific (not shared across machines, unless managed by config management tools)
+
+#### Typical Subdirectories
+
+```
+/etc/
+├── alternatives/              Debian alternatives system symlinks
+├── apt/                       APT package manager config (Debian/Ubuntu)
+│   ├── apt.conf.d/
+│   ├── sources.list
+│   └── sources.list.d/
+├── bash.bashrc                system-wide bash config
+├── cron.d/                    cron job definitions
+├── cron.daily/                daily cron scripts
+├── default/                   default settings for service scripts
+│   └── grub                   GRUB defaults
+├── environment                system-wide environment variables
+├── fstab                      filesystem mount table
+├── group                      group database
+├── hostname                   system hostname
+├── hosts                      static hostname-to-IP resolution
+├── init.d/                    SysV init scripts (legacy, still used)
+├── ld.so.conf                 dynamic linker config
+├── ld.so.conf.d/              additional linker search paths
+├── logrotate.conf             log rotation main config
+├── logrotate.d/               per-service logrotate configs
+├── modprobe.d/                kernel module config
+├── NetworkManager/            NetworkManager config (if used)
+├── nginx/                     nginx config (if installed)
+│   ├── nginx.conf
+│   ├── sites-available/
+│   └── sites-enabled/
+├── nsswitch.conf              name service switch config
+├── os-release                 distro identification
+├── pam.d/                     PAM authentication config
+├── passwd                     user account database
+├── profile                    system-wide shell profile
+├── profile.d/                 shell profile snippets
+├── resolv.conf                DNS resolver config
+├── security/                  PAM security modules config
+│   └── limits.conf            resource limits
+├── shadow                     hashed passwords
+├── ssh/
+│   ├── sshd_config            SSH daemon config
+│   └── ssh_config             SSH client system config
+├── ssl/
+│   ├── certs/                 CA certificates
+│   └── private/               private keys
+├── sudoers                    sudo authorization
+├── sudoers.d/                 sudo authorization snippets
+├── sysctl.conf                kernel parameter tuning
+├── sysctl.d/                  kernel parameter snippets
+├── systemd/
+│   ├── system/                admin-created systemd unit overrides
+│   ├── system.conf            systemd manager config
+│   └── journald.conf          journal config
+├── udev/
+│   └── rules.d/               custom udev rules
+└── yum.repos.d/               YUM/DNF repo config (RHEL/Fedora)
+```
+
+#### Real File Examples
+
+**`/etc/passwd`**
+User account database. Each line: `username:x:uid:gid:gecos:home:shell`. The `x` in the password field indicates the hash is in `/etc/shadow`. Despite the name, this file is world-readable (`0644`). UID 0 is root. UIDs 1-999 are system accounts. UIDs 1000+ are regular users. In containers, this file is often minimal (just `root` and `nobody`).
+
+**`/etc/resolv.conf`**
+DNS resolver configuration. Contains `nameserver` directives and optional `search`/`domain` lines. On modern systems, this is often a symlink managed by `systemd-resolved` (points to `/run/systemd/resolve/stub-resolv.conf`) or NetworkManager. In Kubernetes pods, the kubelet writes this file based on the pod's `dnsPolicy` and the cluster DNS service (typically CoreDNS). Misconfiguring this file breaks all DNS resolution.
+
+**`/etc/os-release`**
+Distribution identification file. Contains key-value pairs: `ID`, `VERSION_ID`, `PRETTY_NAME`, etc. Used by tools to detect the distro. Standardized by systemd/freedesktop.org. Example: `ID=ubuntu`, `VERSION_ID="22.04"`. This is the canonical way to detect the running distribution in scripts.
+
+**`/etc/shadow`**
+Hashed user passwords. Readable only by root (`0640`, owned by `root:shadow`). Contains password hashes (typically yescrypt or SHA-512), aging information, and account expiration dates. If this file is world-readable, the system is compromised.
+
+**`/etc/nsswitch.conf`**
+Name Service Switch configuration. Determines the order of resolution for hostnames, users, groups, and other databases. For example, `hosts: files dns myhostname` means: check `/etc/hosts` first, then DNS, then systemd's myhostname module. Misconfiguration here can cause hostname resolution failures.
+
+**`/etc/sysctl.conf` / `/etc/sysctl.d/*.conf`**
+Kernel parameter tuning applied at boot. Sets values in `/proc/sys/`. Examples: `net.ipv4.ip_forward=1` (required for routing/containers), `vm.swappiness=10`, `fs.inotify.max_user_watches=524288`. Kubernetes nodes often require specific sysctl settings for networking and performance.
+
+#### How to Inspect and Investigate
+
+```bash
+# Find recently modified config files
+find /etc -maxdepth 2 -type f -mtime -7 -ls
+
+# Check file permissions on sensitive files
+stat -c '%a %U:%G %n' /etc/shadow /etc/passwd /etc/sudoers
+# Output: 640 root:shadow /etc/shadow
+#         644 root:root /etc/passwd
+#         440 root:root /etc/sudoers
+```
+
+```bash
+# Diff current config against package defaults (Debian)
+debsums -ce 2>/dev/null | head -20
+
+# See which package a config file belongs to
+dpkg -S /etc/ssh/sshd_config
+# Output: openssh-server: /etc/ssh/sshd_config
+```
+
+```bash
+# Trace what resolv.conf points to
+readlink -f /etc/resolv.conf
+
+# Check effective DNS configuration
+resolvectl status
+```
+
+**Debugging**: When a service behaves unexpectedly, the configuration file in `/etc` is the first place to look. Use `diff` against the package default. Check for override files in `.d/` subdirectories (many services load `*.conf` from a `.d/` directory in addition to or instead of the main config file, and files are loaded in lexicographic order).
+
+#### Permission Patterns
+
+- Most files: `0644` (owner read/write, others read)
+- Sensitive files: `/etc/shadow` (`0640`), `/etc/sudoers` (`0440`), `/etc/ssh/ssh_host_*_key` (`0600`)
+- `/etc/ssl/private/`: `0700`, accessible only by root
+- Directories: `0755`
+- Configuration drop-in directories (`.d/`): `0755` for directory, `0644` for files within
+
+#### Security Considerations
+
+- `/etc/shadow` must be `0640` or stricter. World-readable shadow files allow offline password cracking.
+- `/etc/sudoers` should only be edited via `visudo`, which validates syntax before saving. A syntax error in `sudoers` can lock out all sudo access.
+- `/etc/ssh/sshd_config`: Misconfigurations (e.g., `PermitRootLogin yes`, weak ciphers) are common audit findings.
+- SELinux labels `/etc` files with types like `etc_t`, `passwd_file_t`, `shadow_t`, `sshd_config_t`. These restrict which processes can read or modify configuration.
+- AppArmor profiles reference `/etc` paths for read access. Renames or moves break confinement expectations.
+- Configuration management tools (Ansible, Puppet, Chef) own files in `/etc`. Manual edits may be reverted.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- In containers, `/etc/resolv.conf`, `/etc/hostname`, and `/etc/hosts` are bind-mounted by the container runtime from generated files. They are NOT from the container image.
+- Kubernetes ConfigMaps can be mounted into `/etc/` paths in pods, providing a declarative configuration injection mechanism. These are read-only and backed by tmpfs (projected volumes).
+- Kubernetes Secrets mounted at `/etc/ssl/` paths provide TLS certificates to applications.
+- The `/etc/passwd` and `/etc/group` in a container image define the available users. There is no PAM authentication in typical containers.
+- Modifying `/etc/sysctl.conf` on Kubernetes nodes requires node access (DaemonSet with `hostPID`/`privileged`, or node init scripts). Some managed Kubernetes services expose sysctl tuning through node pool configuration.
+
+#### Common Misconceptions
+
+- **"/etc/resolv.conf is a normal file I can edit."** On modern systems, it is often a symlink managed by systemd-resolved or NetworkManager. Editing the symlink target may be overwritten. Use `resolvectl` or `nmcli` to manage DNS. In Kubernetes, edit the pod spec's `dnsConfig`, not the file.
+- **"All configuration is in /etc."** Many modern applications use XDG directories (`~/.config/`), `/run/` for runtime configuration, and systemd drop-ins. Some configuration is compiled into binaries or provided via environment variables.
+- **"The .d/ directories override the main config."** Behavior varies by application. Some merge `.d/` entries with the main file. Others use `.d/` entries only if the main file includes them. Some ignore the main file entirely if `.d/` entries exist. Always check the application's documentation.
+
+---
+
+### `/home`
+
+**DIRECTORY: /home**
+
+#### Purpose and Design Intent
+
+`/home` contains per-user home directories. Each user defined in `/etc/passwd` has a home directory (typically `/home/<username>`) where personal files, shell configuration, and application data reside. It provides per-user isolation and a standard location for user-specific state.
+
+On some systems (notably RHEL with NFS), `/home` may be an NFS mount for centralized home directories.
+
+#### What Type of Data Lives Here
+
+- User files, documents, downloads
+- Shell configuration (`.bashrc`, `.bash_profile`, `.profile`, `.zshrc`)
+- Application configuration (`~/.config/`, `~/.ssh/`, `~/.gnupg/`)
+- Application caches and data (`~/.cache/`, `~/.local/`)
+- Dynamic, persistent, user-owned
+
+#### Typical Subdirectories
+
+```
+/home/
+└── username/
+    ├── .bash_history           shell command history
+    ├── .bash_logout            executed on logout
+    ├── .bashrc                 non-login shell config
+    ├── .cache/                 XDG cache directory
+    ├── .config/                XDG config directory
+    ├── .gnupg/                 GPG keys and config
+    ├── .local/
+    │   ├── bin/                user-local executables
+    │   └── share/              user-local data files
+    ├── .profile                login shell config
+    ├── .ssh/
+    │   ├── authorized_keys     public keys for SSH login
+    │   ├── config              SSH client config
+    │   ├── id_ed25519          private key
+    │   ├── id_ed25519.pub      public key
+    │   └── known_hosts         remembered host keys
+    └── .vimrc                  Vim configuration
+```
+
+#### Real File Examples
+
+**`/home/user/.ssh/authorized_keys`**
+Public keys that grant SSH access to this account. Each line is a key. Permissions must be `0600` (or `0644`). If permissions are too open, `sshd` silently ignores the file. This is one of the most common SSH debugging issues.
+
+**`/home/user/.bashrc`**
+Executed for every non-login interactive bash shell (new terminal windows, subshells). Contains aliases, functions, PS1 customization, and environment variable modifications. Not executed for login shells (use `.bash_profile` or `.profile` for those).
+
+**`/home/user/.config/systemd/user/`**
+User-level systemd units. Users can define and manage their own services without root access. Managed via `systemctl --user`.
+
+**`/home/user/.kube/config`**
+Kubernetes client configuration. Contains cluster endpoints, authentication credentials, and context definitions. Used by `kubectl`. Permissions should be `0600`.
+
+#### How to Inspect and Investigate
+
+```bash
+# Show disk usage per home directory
+du -sh /home/*/
+
+# Check permissions on .ssh directory (must be 0700)
+stat -c '%a %n' /home/*/.ssh/
+```
+
+```bash
+# Find large files in a home directory
+find /home/username -type f -size +100M -ls
+
+# Check for world-readable private keys
+find /home -name 'id_*' ! -name '*.pub' -perm /044 -ls
+```
+
+#### Permission Patterns
+
+- Home directories: `0700` or `0750` (distribution-dependent; Ubuntu uses `0750`, RHEL uses `0700` by default)
+- `.ssh/`: `0700`
+- `.ssh/authorized_keys`: `0600`
+- `.ssh/id_*` (private keys): `0600`
+- `.gnupg/`: `0700`
+
+#### Security Considerations
+
+- World-readable home directories leak user files. Default `umask` should be `0077` or `0027`.
+- SSH key permissions are security-critical. `sshd` refuses keys in files with incorrect permissions.
+- `~/.bashrc` injection is a persistence mechanism for attackers. Monitor for unauthorized modifications.
+- SELinux labels home directories with `user_home_t` and SSH keys with `ssh_home_t`.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- Containers typically have no `/home` directory or a minimal one. The container runs as a single user (often `root` or a specific numeric UID).
+- Kubernetes does not provide persistent home directories. If a pod needs user-specific persistent storage, use a PersistentVolumeClaim mounted at the application's data path.
+- Cloud VMs (EC2, GCE) create user home directories for the default user (`ubuntu`, `ec2-user`, `centos`). SSH authorized_keys in these directories is the primary access mechanism.
+
+#### Common Misconceptions
+
+- **"root's home directory is /home/root."** Root's home directory is `/root`, not `/home/root`. This ensures root can log in even if `/home` is on a separate (unmounted) partition.
+- **".bashrc runs for every shell."** It runs for non-login interactive shells. Login shells read `.bash_profile` (or `.profile`). Many setups have `.bash_profile` source `.bashrc` to get consistent behavior.
+
+---
+
+### `/lib` and `/lib64`
+
+**DIRECTORY: /lib and /lib64**
+
+#### Purpose and Design Intent
+
+`/lib` contains shared libraries needed by binaries in `/bin` and `/sbin` and kernel modules. `/lib64` exists on x86_64 systems for 64-bit libraries when the system supports both 32-bit and 64-bit binaries (multilib).
+
+On merged-`/usr` systems, `/lib` is a symlink to `/usr/lib` and `/lib64` to `/usr/lib64`.
+
+#### What Type of Data Lives Here
+
+- Shared object files (`.so` files, dynamically linked libraries)
+- Kernel modules (`.ko` files in `/lib/modules/`)
+- Firmware blobs (`/lib/firmware/`)
+- Static, persistent, package-manager-managed
+
+#### Typical Subdirectories
+
+```
+/lib/
+├── firmware/                        binary firmware for hardware
+│   ├── iwlwifi-*.ucode             Intel WiFi firmware
+│   └── amdgpu/                     AMD GPU firmware
+├── modules/
+│   └── 5.15.0-91-generic/          kernel modules for specific version
+│       ├── kernel/
+│       │   ├── drivers/
+│       │   ├── fs/
+│       │   ├── net/
+│       │   └── sound/
+│       ├── modules.dep             module dependency map
+│       ├── modules.alias           module alias map
+│       └── modules.builtin         built-in module list
+├── systemd/
+│   ├── system/                     vendor/package systemd units
+│   └── systemd                     systemd binary (PID 1)
+├── udev/
+│   └── rules.d/                    package-provided udev rules
+├── x86_64-linux-gnu/               Debian multiarch lib path
+│   ├── libc.so.6                   C library
+│   ├── libpthread.so.0             POSIX threads
+│   └── ld-linux-x86-64.so.2       dynamic linker
+└── ld-linux-x86-64.so.2 -> ...    dynamic linker (top-level symlink)
+
+/lib64/
+└── ld-linux-x86-64.so.2           dynamic linker for 64-bit binaries
+```
+
+#### Real File Examples
+
+**`/lib/x86_64-linux-gnu/libc.so.6` (Debian) / `/lib64/libc.so.6` (RHEL)**
+The GNU C Library (glibc). Nearly every dynamically linked binary depends on it. It provides the implementation of standard C functions (`printf`, `malloc`, `open`, etc.) and the POSIX API. Corruption or version mismatch renders the system unbootable.
+
+**`/lib/modules/$(uname -r)/kernel/`**
+Compiled kernel modules organized by subsystem (drivers, filesystems, networking). Loaded on demand by `modprobe`. Each kernel version has its own directory. If the modules directory does not match the running kernel, hardware may not function.
+
+**`/lib/systemd/system/`**
+Vendor-provided systemd unit files. These are the "default" unit definitions installed by packages. Administrator overrides go in `/etc/systemd/system/`. The systemd unit search order is: `/etc/systemd/system/` (admin) > `/run/systemd/system/` (runtime) > `/lib/systemd/system/` (vendor).
+
+**`/lib/firmware/`**
+Binary firmware files loaded by device drivers at initialization. The kernel's firmware loading mechanism (`request_firmware()`) reads from this directory. Missing firmware causes hardware to malfunction (common with WiFi adapters and GPUs).
+
+#### How to Inspect and Investigate
+
+```bash
+# Check which shared libraries a binary uses
+ldd /bin/ls
+# Output shows library paths and the dynamic linker used
+
+# Find the actual library file behind a symlink chain
+readlink -f /lib/x86_64-linux-gnu/libc.so.6
+```
+
+```bash
+# List loaded kernel modules
+lsmod
+
+# Show module info and dependencies
+modinfo ext4
+```
+
+#### Permission Patterns
+
+- Libraries: `0755` or `0644`, owned by `root:root`.
+- Kernel modules: `0644`, owned by `root:root`.
+- `/lib/systemd/system/`: `0644` for unit files.
+
+#### Security Considerations
+
+- Replacing shared libraries (especially `libc`) achieves arbitrary code execution in every dynamically linked process. File integrity monitoring (AIDE, OSSEC) should cover `/lib`.
+- Kernel modules run with kernel privileges. Unsigned module loading should be restricted (module signing enforcement, `CONFIG_MODULE_SIG_FORCE`).
+- SELinux labels: `lib_t` for libraries, `modules_object_t` for kernel modules.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- Container images include their own `/lib` with the libraries their applications need. There is no sharing of libraries between containers or with the host.
+- Alpine Linux uses `musl` libc instead of `glibc`. Binaries compiled against `glibc` do not work on Alpine without compatibility layers.
+- Kernel modules are not available inside containers (the host kernel provides all module functionality).
+- Distroless images minimize `/lib` to only the libraries the application needs, reducing image size and attack surface.
+
+#### Common Misconceptions
+
+- **"/lib64 is for 64-bit systems."** More precisely, `/lib64` exists on systems that support multilib (32-bit and 64-bit binaries simultaneously). Pure 64-bit systems may only have `/lib`, especially on merged-`/usr` distributions.
+- **"I should put my own .so files in /lib."** Use `/usr/local/lib` and update `/etc/ld.so.conf` or set `LD_LIBRARY_PATH`. Do not pollute the distribution's `/lib`.
+
+---
+
+### `/media`
+
+**DIRECTORY: /media**
+
+#### Purpose and Design Intent
+
+`/media` is the mount point for removable media: USB drives, optical discs, SD cards, external hard drives. Desktop environments (GNOME, KDE) and `udisks2` automatically mount removable media under `/media/<username>/<label>`.
+
+The FHS distinguishes `/media` (automounted removable media) from `/mnt` (temporary administrator mounts).
+
+#### What Type of Data Lives Here
+
+- Mounted filesystems from removable devices
+- Dynamic (appears/disappears with device insertion/removal)
+- Not present on most servers or in containers
+
+#### Typical Subdirectories
+
+```
+/media/
+└── username/
+    ├── USB_DRIVE/                   auto-mounted USB stick
+    └── CDROM/                       optical disc
+```
+
+#### How to Inspect and Investigate
+
+```bash
+# List mounted removable media
+findmnt --target /media
+lsblk -f
+```
+
+```bash
+# Manual mount of a USB drive
+mount /dev/sdb1 /media/usb
+# Check filesystem of removable device
+blkid /dev/sdb1
+```
+
+#### Cloud / Container / Kubernetes Relevance
+
+- Not relevant in cloud or container contexts. `/media` is typically empty or absent.
+- Kubernetes does not use `/media` for volumes.
+
+#### Common Misconceptions
+
+- **"/media and /mnt are interchangeable."** By convention, `/media` is for automounted removable media and `/mnt` is for temporary manual mounts. In practice, both are just directories, but tooling (desktop environments, udisks) assumes `/media`.
+
+---
+
+### `/mnt`
+
+**DIRECTORY: /mnt**
+
+#### Purpose and Design Intent
+
+`/mnt` is a generic mount point for temporarily mounting filesystems by the system administrator. It predates `/media` and has no inherent structure. System administrators use it for ad-hoc mounts during maintenance: mounting a rescue disk, a backup volume, an NFS share for data migration.
+
+#### What Type of Data Lives Here
+
+- Whatever filesystem is mounted here
+- Transient, manual, administrative
+
+#### How to Inspect and Investigate
+
+```bash
+# Check if anything is mounted at /mnt
+findmnt /mnt
+mount | grep /mnt
+```
+
+```bash
+# Mount an NFS share for data migration
+mount -t nfs server:/export /mnt
+ls /mnt/
+```
+
+#### Cloud / Container / Kubernetes Relevance
+
+- Cloud instances sometimes mount additional disks at `/mnt` (e.g., AWS instance store volumes default to `/mnt` on some AMIs).
+- Not used by Kubernetes for volume mounts (volumes go to `/var/lib/kubelet/pods/<pod-uid>/volumes/`).
+- In containers, `/mnt` is typically empty.
+
+---
+
+### `/opt`
+
+**DIRECTORY: /opt**
+
+#### Purpose and Design Intent
+
+`/opt` is for add-on application software packages. Software installed here is self-contained: each application gets its own subtree (`/opt/<vendor>/<package>`). This is the correct location for third-party software that does not integrate into the distribution's package management.
+
+#### What Type of Data Lives Here
+
+- Binaries, libraries, configuration, and data for self-contained applications
+- Static, persistent, managed by the application's own installer
+- Examples: Google Chrome (`/opt/google/chrome`), Datadog Agent (`/opt/datadog-agent`), custom enterprise software
+
+#### Typical Subdirectories
+
+```
+/opt/
+├── containerd/                    containerd (if installed standalone)
+│   └── bin/
+├── cni/
+│   └── bin/                       CNI plugins for container networking
+├── google/
+│   └── chrome/                    Google Chrome browser
+├── datadog-agent/                 Datadog monitoring agent
+└── mycompany/
+    └── myapp/
+        ├── bin/
+        ├── lib/
+        ├── etc/
+        └── share/
+```
+
+#### Real File Examples
+
+**`/opt/cni/bin/`**
+Container Network Interface plugin binaries. Kubernetes uses CNI for pod networking. Plugins like `bridge`, `loopback`, `flannel`, `calico`, `cilium` are stored here. Missing or incompatible CNI plugins cause pod networking failures (`NetworkNotReady`).
+
+**`/opt/google/chrome/google-chrome`**
+Google Chrome browser binary. Installed by Chrome's own `.deb` or `.rpm` package. Self-contained with its own bundled libraries.
+
+#### How to Inspect and Investigate
+
+```bash
+# See what's installed in /opt
+ls -la /opt/
+du -sh /opt/*/
+```
+
+```bash
+# Check CNI plugin versions
+ls -la /opt/cni/bin/
+/opt/cni/bin/bridge 2>&1 | head -1
+```
+
+#### Permission Patterns
+
+- `/opt/<package>/` directories owned by `root:root` or the package-specific user.
+- Binaries: `0755`. Configuration: `0644` or stricter.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- CNI plugin binaries in `/opt/cni/bin/` are critical for Kubernetes node networking. CNI plugins are typically installed by DaemonSets that copy binaries to this path on the host via `hostPath` volumes.
+- Some monitoring agents (Datadog, New Relic) install to `/opt` on Kubernetes nodes.
+- Container images may use `/opt` for application installation.
+
+#### Common Misconceptions
+
+- **"/opt is for optional software."** The name suggests it, but more precisely, `/opt` is for self-contained third-party software packages. Software installed here should not scatter files across `/usr`, `/etc`, `/var`.
+
+---
+
+### `/proc`
+
+**DIRECTORY: /proc**
+
+#### Purpose and Design Intent
+
+`/proc` is a virtual filesystem (`procfs`) that exposes kernel internal state and per-process information as a file hierarchy. It is the primary interface for userspace tools to query and modify kernel runtime parameters. The kernel generates file contents on-the-fly when read; there is no disk storage.
+
+`/proc` was originally designed for process information (hence the name) but has expanded to cover a wide range of kernel subsystems. Some of this scope is being migrated to `/sys` (sysfs) for better organization.
+
+Mounted as: `mount -t proc proc /proc`
+
+#### What Type of Data Lives Here
+
+- Per-process state (virtual, dynamic, ephemeral)
+- Kernel runtime parameters (readable and writable via `/proc/sys/`)
+- Hardware information
+- Kernel configuration and statistics
+- cgroup information (v1)
+
+All data is ephemeral and generated on read.
+
+#### Typical Subdirectories
+
+```
+/proc/
+├── 1/                              PID 1 (init/systemd) process directory
+│   ├── cmdline                     command line arguments (null-separated)
+│   ├── cgroup                      cgroup membership
+│   ├── cwd -> /                    current working directory symlink
+│   ├── environ                     environment variables (null-separated)
+│   ├── exe -> /usr/lib/systemd/systemd   executable symlink
+│   ├── fd/                         open file descriptors (symlinks)
+│   │   ├── 0 -> /dev/null
+│   │   ├── 1 -> /dev/null
+│   │   └── ...
+│   ├── fdinfo/                     per-fd details (offset, flags)
+│   ├── io                          I/O statistics
+│   ├── limits                      resource limits (RLIMIT_*)
+│   ├── maps                        memory mappings
+│   ├── mountinfo                   mount details for this process
+│   ├── mounts                      active mounts (this pid's namespace)
+│   ├── net/                        network stack info (per-netns)
+│   ├── ns/                         namespace file descriptors
+│   │   ├── cgroup
+│   │   ├── ipc
+│   │   ├── mnt
+│   │   ├── net
+│   │   ├── pid
+│   │   ├── user
+│   │   └── uts
+│   ├── oom_score                   OOM killer score
+│   ├── oom_score_adj               OOM score adjustment (-1000 to 1000)
+│   ├── root -> /                   root directory symlink
+│   ├── smaps                       detailed memory map with per-mapping stats
+│   ├── stat                        process status (raw, see proc(5))
+│   ├── statm                       memory usage summary
+│   ├── status                      human-readable process status
+│   └── task/                       per-thread subdirectories
+│       └── <tid>/
+├── buddyinfo                       memory fragmentation info
+├── cgroups                         registered cgroup controllers
+├── cmdline                         kernel boot command line
+├── cpuinfo                         CPU information
+├── devices                         registered character and block devices
+├── diskstats                       disk I/O statistics
+├── filesystems                     supported filesystem types
+├── interrupts                      IRQ counters per CPU
+├── iomem                           I/O memory map
+├── kallsyms                        kernel symbol table (all symbols)
+├── loadavg                         system load averages
+├── meminfo                         detailed memory usage
+├── modules                         loaded kernel modules
+├── mounts -> self/mounts           mount table shortcut
+├── net/                            network statistics (init netns)
+│   ├── dev                         per-interface statistics
+│   ├── tcp                         TCP connection table
+│   ├── udp                         UDP connection table
+│   └── unix                        Unix domain socket table
+├── partitions                      known disk partitions
+├── self -> <calling-pid>           symlink to calling process
+├── slabinfo                        kernel slab allocator statistics
+├── stat                            kernel/system statistics
+├── swaps                           swap device information
+├── sys/                            writable kernel parameters
+│   ├── fs/
+│   │   ├── file-max                max open files system-wide
+│   │   ├── inotify/
+│   │   │   └── max_user_watches    max inotify watches per user
+│   │   └── nr_open                 max fd number per process
+│   ├── kernel/
+│   │   ├── hostname                system hostname
+│   │   ├── osrelease               kernel version string
+│   │   ├── panic                   panic timeout
+│   │   ├── pid_max                 maximum PID value
+│   │   ├── random/
+│   │   │   └── entropy_avail       available entropy
+│   │   └── threads-max             max threads system-wide
+│   ├── net/
+│   │   ├── core/
+│   │   │   ├── somaxconn           max listen backlog
+│   │   │   └── rmem_max            max receive buffer
+│   │   └── ipv4/
+│   │       ├── ip_forward          enable IP forwarding (0/1)
+│   │       ├── ip_local_port_range ephemeral port range
+│   │       ├── tcp_keepalive_time  TCP keepalive interval
+│   │       ├── tcp_max_syn_backlog SYN queue size
+│   │       └── tcp_tw_reuse        TIME_WAIT socket reuse
+│   └── vm/
+│       ├── dirty_ratio             dirty page ratio before writeback
+│       ├── overcommit_memory       memory overcommit policy
+│       ├── panic_on_oom            panic when OOM (0/1)
+│       ├── swappiness              swap aggressiveness (0-200)
+│       └── vfs_cache_pressure      dentry/inode cache reclaim pressure
+├── uptime                          system uptime in seconds
+├── version                         kernel version string
+└── vmstat                          virtual memory statistics
+```
+
+#### Real File Examples
+
+**`/proc/<pid>/status`**
+Human-readable process status. Includes: process name, state (running, sleeping, zombie), PID, PPID, UID, GID, memory usage (VmRSS, VmSize), thread count, capabilities (CapInh, CapPrm, CapEff, CapBnd, CapAmb), seccomp mode, and cgroup namespace info. This is the go-to file for quickly understanding a process's state.
+
+**`/proc/<pid>/maps`**
+Memory mapping of the process address space. Each line shows: address range, permissions (rwxp/rwxs), offset, device, inode, and pathname. Shows which libraries are loaded and where. Critical for debugging memory layout, ASLR, and shared memory issues.
+
+**`/proc/<pid>/ns/`**
+Namespace file descriptors. Each file represents a namespace the process belongs to. `readlink /proc/<pid>/ns/mnt` shows the mount namespace ID. Two processes in the same namespace will show the same inode number. `nsenter --target <pid> --mount` enters a process's mount namespace.
+
+**`/proc/meminfo`**
+Detailed system memory breakdown. Key fields: `MemTotal`, `MemFree`, `MemAvailable` (estimated available for new allocations without swapping), `Buffers`, `Cached`, `SwapTotal`, `SwapFree`, `Slab`, `SReclaimable`. `MemAvailable` is more useful than `MemFree` for capacity assessment. This is what `free -h` reads.
+
+**`/proc/sys/net/ipv4/ip_forward`**
+Contains `0` or `1`. Controls whether the kernel forwards IP packets between interfaces. Must be `1` for routing, NAT, and container networking. Set at runtime with `echo 1 > /proc/sys/net/ipv4/ip_forward` or persistently via `sysctl net.ipv4.ip_forward=1` in `/etc/sysctl.d/`.
+
+**`/proc/sys/fs/inotify/max_user_watches`**
+Maximum number of inotify watches per user. Default is often 8192, which is insufficient for development tools (webpack, IDE file watchers) and monitoring agents. Kubernetes nodes often need this increased to 524288 or higher.
+
+#### How to Inspect and Investigate
+
+```bash
+# View a process's open file descriptors
+ls -la /proc/$(pgrep nginx | head -1)/fd/
+# Shows symlinks to open files, sockets, pipes
+
+# Check a process's memory usage
+grep -E 'VmRSS|VmSize|VmSwap' /proc/$(pgrep nginx | head -1)/status
+```
+
+```bash
+# Read kernel parameters
+sysctl net.ipv4.ip_forward
+cat /proc/sys/net/ipv4/ip_forward
+
+# Set a kernel parameter at runtime
+sysctl -w net.ipv4.ip_forward=1
+echo 1 > /proc/sys/net/ipv4/ip_forward
+```
+
+```bash
+# Check which cgroup a process belongs to
+cat /proc/<pid>/cgroup
+# cgroups v1 output: 12:memory:/system.slice/docker-abc123.scope
+# cgroups v2 output: 0::/system.slice/docker-abc123.scope
+
+# View namespace membership
+ls -la /proc/<pid>/ns/
+```
+
+```bash
+# System overview
+cat /proc/loadavg      # load averages and runnable/total processes
+cat /proc/uptime       # seconds since boot, idle seconds
+cat /proc/cpuinfo | grep "model name" | head -1
+```
+
+**Debugging**:
+- Process stuck? Check `/proc/<pid>/status` for state (`D` = uninterruptible sleep, likely I/O wait), `/proc/<pid>/wchan` for the kernel function it's blocked in.
+- OOM killed? Check `dmesg` and `/proc/<pid>/oom_score_adj`. Kubernetes sets `oom_score_adj` for guaranteed pods to -997, burstable to calculated values, and besteffort to 1000.
+- Network issues? `/proc/net/tcp` shows all TCP connections with state, local/remote addresses (hex-encoded), and queue sizes.
+
+#### Permission Patterns
+
+- `/proc/<pid>/` directories are owned by the process's effective UID.
+- Some files (`environ`, `maps`, `mem`) require same-UID or `CAP_SYS_PTRACE` to read.
+- `/proc/sys/` files: readable by all, writable only by root (or processes with `CAP_SYS_ADMIN`).
+- `/proc/kallsyms`: may be restricted by `kptr_restrict` sysctl (values: 0=visible, 1=hidden unless CAP_SYSLOG, 2=always hidden).
+
+#### Security Considerations
+
+- `/proc/<pid>/environ` exposes environment variables, which often contain secrets (database passwords, API keys). Access requires same-UID or ptrace capability.
+- `/proc/kallsyms` and `/proc/modules` reveal kernel memory layout, useful for exploit development. `kptr_restrict=2` hides kernel pointers.
+- `hidepid` mount option: `mount -t proc proc /proc -o hidepid=2` hides other users' process directories. `hidepid=invisible` (kernel 5.8+) is the modern equivalent.
+- In containers, `/proc` is mounted with limited visibility. The container runtime masks sensitive paths (`/proc/kcore`, `/proc/sched_debug`, `/proc/keys`, `/proc/timer_list`) by bind-mounting `/dev/null` or read-only tmpfs over them.
+- Writing to `/proc/sysrq-trigger` can immediately reboot, crash, or kill processes on the machine. Restrict access.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- Containers mount their own `/proc` via the PID namespace. A container's `/proc` shows only processes within that container's PID namespace.
+- `/proc/meminfo` inside a container shows the **host's** memory, not the container's limit. Tools reading `/proc/meminfo` (Java, Go runtime) may overcommit. cgroup-aware runtimes read from `/sys/fs/cgroup/` instead. Newer kernels (5.19+) support LXCFS or cgroup-based `/proc` overrides.
+- `/proc/cpuinfo` inside a container shows all host CPUs, not the container's CPU limit. This causes applications to spawn too many threads.
+- `/proc/sys/` writes inside a container affect the host (unless using sysctl namespacing). Kubernetes supports "safe" sysctls (`kernel.shm_rmid_forced`, `net.ipv4.ip_local_port_range`, etc.) that are namespaced and can be set per-pod.
+- Monitoring tools (Prometheus node_exporter) read extensively from `/proc` on the host. They need to be mounted with the host's `/proc` if running in containers.
+
+#### Common Misconceptions
+
+- **"/proc files have a size of 0 but contain data."** Correct: `stat` reports 0 bytes because content is generated on read. Do not use file size to determine if a `/proc` file is empty.
+- **"/proc is slow."** No, `/proc` reads are in-memory kernel function calls. They are fast. However, reading `/proc/<pid>/smaps` for thousands of processes can be expensive because the kernel walks page tables.
+- **"Writing to /proc/sys inside a container is safe."** Only for namespaced sysctls. Non-namespaced sysctl writes in a container affect the entire host. Kubernetes documents which sysctls are safe (namespaced).
+
+---
+
+### `/run`
+
+**DIRECTORY: /run**
+
+#### Purpose and Design Intent
+
+`/run` is a tmpfs-mounted directory for transient runtime data that must not persist across reboots. It replaced multiple legacy locations (`/var/run`, `/var/lock`, `/dev/.run`) that historically served this purpose but were on persistent storage, causing stale data issues after crashes.
+
+`/var/run` is now a symlink to `/run` on modern systems. `/var/lock` is a symlink to `/run/lock`.
+
+Mounted as: `mount -t tmpfs tmpfs /run` (early in boot, before most services start).
+
+#### What Type of Data Lives Here
+
+- PID files (`.pid` files containing process IDs)
+- Unix domain sockets
+- Lock files
+- Named pipes
+- Runtime state files
+- systemd runtime unit files
+- All ephemeral, all lost on reboot or power loss
+
+#### Typical Subdirectories
+
+```
+/run/
+├── containerd/                    containerd runtime socket and state
+│   └── containerd.sock
+├── dbus/
+│   └── system_bus_socket          D-Bus system socket
+├── docker/                        Docker runtime state
+│   ├── containerd/
+│   └── docker.sock                Docker engine socket
+├── initctl                        SysV init control FIFO (legacy)
+├── lock/                          lock files (symlink target for /var/lock)
+│   └── lvm/
+├── log/
+│   └── journal/                   systemd journal volatile storage
+├── mount/                         mount utility runtime state
+├── snapd/                         Snap daemon runtime state
+├── sshd.pid                       SSH daemon PID file
+├── systemd/
+│   ├── generator/                 generated unit files
+│   ├── generator.early/
+│   ├── generator.late/
+│   ├── journal/
+│   ├── notify                     systemd notification socket
+│   ├── private/
+│   ├── system/                    runtime-generated units
+│   ├── transient/                 transient units (systemd-run)
+│   └── units/
+├── tmpfiles.d/                    runtime tmpfiles state
+├── udev/
+│   ├── data/                      udev device database
+│   └── rules.d/                   runtime udev rules
+├── user/
+│   └── 1000/                      per-user runtime directory (XDG_RUNTIME_DIR)
+│       └── systemd/
+│           └── private/
+└── utmp                           current login records
+```
+
+#### Real File Examples
+
+**`/run/docker.sock` (or `/run/containerd/containerd.sock`)**
+Unix domain socket for the container runtime API. `docker` CLI communicates with `dockerd` via this socket. Mounting this socket into a container (common in CI/CD pipelines) grants that container full control over the container runtime -- a significant security risk ("Docker socket mounting" attack vector).
+
+**`/run/systemd/system/`**
+Runtime-generated systemd units. These are created dynamically (by generators, `systemd-run`, or API calls) and exist only until reboot. Generator output from `/etc/fstab`, crypttab, and other sources appears here.
+
+**`/run/user/1000/`**
+The XDG runtime directory for UID 1000. Set as `$XDG_RUNTIME_DIR`. Contains user-specific runtime files: PulseAudio sockets, D-Bus session sockets, Wayland sockets. Created by `pam_systemd` on login. Backed by tmpfs. Size-limited (typically 10% of RAM or 256MB).
+
+**`/run/udev/data/`**
+udev's runtime device database. Contains parsed device properties from udev rules. Queried by `udevadm info`. Lost on reboot; rebuilt during boot as devices are discovered.
+
+#### How to Inspect and Investigate
+
+```bash
+# Check tmpfs usage on /run
+df -h /run
+# Output: tmpfs  1.6G  2.1M  1.6G  1% /run
+
+# List sockets in /run
+find /run -type s -ls
+```
+
+```bash
+# Check PID files for running services
+cat /run/sshd.pid
+# Verify the PID is actually running
+kill -0 $(cat /run/sshd.pid) && echo "running" || echo "stale"
+
+# List files opened by a daemon in /run
+lsof +D /run/docker/
+```
+
+**Debugging**: Stale PID files in `/run` on persistent storage were a major source of service startup failures in pre-tmpfs systems. With tmpfs-backed `/run`, stale files are automatically cleaned on reboot. If a service fails to start claiming "already running," check the PID file and verify the process.
+
+#### Permission Patterns
+
+- `/run/` itself: `0755`, owned by `root:root`
+- PID files: `0644`, owned by the service's user or root
+- Sockets: permissions vary; Docker socket is `0660` owned by `root:docker`
+- `/run/user/<uid>/`: `0700`, owned by the user
+
+#### Security Considerations
+
+- The Docker socket (`/run/docker.sock`) is equivalent to root access. Any process that can write to this socket can create privileged containers that escape all isolation. Never mount it into untrusted containers.
+- `/run/user/<uid>/` should be `0700`. If world-readable, per-user session sockets (D-Bus, Wayland) are exposed.
+- In SELinux, runtime files get labels like `var_run_t`, `docker_var_run_t`, `initrc_var_run_t`.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- Inside containers, `/run` exists but is a new tmpfs, not the host's `/run`.
+- Kubernetes CRI sockets (containerd socket, CRI-O socket) are on the host's `/run`. Node-level debugging pods may need `hostPath` access to these.
+- `systemd-run` inside a container is only available if the container runs systemd as PID 1 (uncommon in Kubernetes).
+- CI/CD pipelines that mount `/run/docker.sock` from the host into a build container to run "Docker-in-Docker" expose the entire host's container runtime. Use rootless Docker or Kaniko instead.
+
+#### Common Misconceptions
+
+- **"/var/run and /run are different."** On modern systems, `/var/run` is a symlink to `/run`. They are the same directory. Legacy scripts may reference `/var/run`; this still works.
+- **"/run persists across reboots."** No. `/run` is a tmpfs. Everything is lost on reboot. That is its purpose.
+
+---
+
+### `/srv`
+
+**DIRECTORY: /srv**
+
+#### Purpose and Design Intent
+
+`/srv` contains data served by the system. The FHS defines it as "site-specific data served by this system." It is intended for files served by web servers, FTP servers, and other network services. The goal is to separate served content from system configuration and operating system data.
+
+In practice, `/srv` is underused. Many distributions and applications use `/var/www` for web content or application-specific paths.
+
+#### What Type of Data Lives Here
+
+- Web server document roots
+- FTP server content
+- Version control repositories (e.g., Gitolite)
+- Static, persistent, service-specific
+
+#### Typical Subdirectories
+
+```
+/srv/
+├── ftp/                     FTP server root
+├── http/                    web server document root (Arch convention)
+├── www/                     web server document root (alternative)
+└── git/                     bare git repositories
+```
+
+#### Cloud / Container / Kubernetes Relevance
+
+- Rarely used in cloud-native architectures. Application data is typically in container images, object storage (S3), or persistent volumes mounted at application-specific paths.
+- Kubernetes volumes mount at arbitrary paths defined in pod specs, not necessarily `/srv`.
+
+---
+
+### `/sys`
+
+**DIRECTORY: /sys**
+
+#### Purpose and Design Intent
+
+`/sys` is a virtual filesystem (`sysfs`) that exposes the kernel's device model and other kernel subsystems as a structured hierarchy. Unlike `/proc`, which grew organically, `sysfs` was designed with a clear organizational model based on kernel object relationships (kobjects, ksets).
+
+`sysfs` represents the kernel's view of:
+- **Devices**: hardware and virtual, organized by bus, class, and driver
+- **Kernel subsystems**: block layer, firmware, power management, modules
+- **cgroup filesystem**: resource control groups (when cgroups v2 or v1 are mounted here)
+
+Mounted as: `mount -t sysfs sysfs /sys`
+
+#### What Type of Data Lives Here
+
+- Device attributes (read/write per-device tunables)
+- Kernel object hierarchies
+- Bus topology
+- Power management state
+- Block device tunables
+- cgroup hierarchies
+- All virtual, generated on read, ephemeral
+
+#### Typical Subdirectories
+
+```
+/sys/
+├── block/                          block device symlinks
+│   ├── sda -> ../devices/pci0000:00/.../block/sda
+│   └── dm-0 -> ../devices/virtual/block/dm-0
+├── bus/                            bus subsystems
+│   ├── cpu/
+│   │   └── devices/
+│   │       ├── cpu0
+│   │       └── cpu1
+│   ├── pci/
+│   │   ├── devices/               PCI device symlinks
+│   │   └── drivers/               PCI driver bindings
+│   ├── scsi/
+│   └── usb/
+├── class/                          device classes (logical grouping)
+│   ├── block/                      block devices
+│   ├── dmi/                        SMBIOS/DMI data
+│   ├── input/                      input devices
+│   ├── net/                        network interfaces
+│   │   ├── eth0/
+│   │   │   ├── address             MAC address
+│   │   │   ├── mtu                 current MTU
+│   │   │   ├── operstate           link state (up/down)
+│   │   │   ├── speed               link speed (Mbps)
+│   │   │   └── statistics/
+│   │   │       ├── rx_bytes
+│   │   │       └── tx_bytes
+│   │   └── lo/
+│   ├── thermal/                    thermal zones
+│   └── tty/                        terminal devices
+├── devices/                        device hierarchy (authoritative tree)
+│   ├── pci0000:00/                 PCI root bus
+│   │   └── 0000:00:1f.2/          PCI device
+│   ├── platform/                   platform devices
+│   ├── system/
+│   │   ├── cpu/
+│   │   │   ├── cpu0/
+│   │   │   │   ├── cpufreq/       CPU frequency scaling
+│   │   │   │   └── topology/      CPU topology (core, socket)
+│   │   │   ├── cpufreq/
+│   │   │   └── online              online CPUs bitmask
+│   │   ├── memory/                 memory hotplug blocks
+│   │   └── node/                   NUMA nodes
+│   │       └── node0/
+│   │           └── meminfo         per-NUMA-node memory info
+│   └── virtual/
+│       ├── block/                  virtual block devices
+│       ├── misc/
+│       └── net/
+├── firmware/                       firmware interfaces
+│   ├── acpi/                       ACPI tables and methods
+│   ├── dmi/                        DMI/SMBIOS tables
+│   │   └── tables/
+│   └── efi/                        EFI variables
+├── fs/                             filesystem kernel objects
+│   ├── cgroup/                     cgroups v2 unified hierarchy
+│   │   ├── cgroup.controllers      available controllers
+│   │   ├── cgroup.subtree_control  enabled child controllers
+│   │   ├── cpu.stat
+│   │   ├── memory.current          current memory usage
+│   │   ├── memory.max              memory limit
+│   │   ├── system.slice/
+│   │   │   └── docker-<id>.scope/
+│   │   │       ├── cpu.max         CPU time limit (quota period)
+│   │   │       ├── cpu.stat        CPU usage statistics
+│   │   │       ├── memory.current
+│   │   │       ├── memory.max
+│   │   │       ├── memory.swap.max
+│   │   │       └── pids.current
+│   │   └── user.slice/
+│   ├── ext4/                       ext4-specific tunables
+│   │   └── sda1/
+│   └── fuse/
+├── kernel/                         kernel subsystem controls
+│   ├── config/                     kernel .config (if CONFIG_IKCONFIG)
+│   ├── debug/                      debugfs mount point
+│   ├── iommu_groups/               IOMMU grouping for VFIO
+│   ├── mm/                         memory management
+│   │   ├── hugepages/
+│   │   └── transparent_hugepage/
+│   │       ├── enabled              THP policy (always/madvise/never)
+│   │       └── defrag
+│   ├── security/                   LSM state
+│   └── slab/                       slab allocator info
+├── module/                         loaded kernel modules
+│   └── ext4/
+│       └── parameters/             module parameters
+└── power/                          system power management
+    ├── state                        sleep states (mem, disk, freeze)
+    └── wakeup_count
+```
+
+#### Real File Examples
+
+**`/sys/class/net/eth0/address`**
+The MAC address of the `eth0` network interface. Read-only. Useful for asset identification and network debugging.
+
+**`/sys/class/net/eth0/mtu`**
+Current MTU of the interface. Readable and writable. `echo 9000 > /sys/class/net/eth0/mtu` sets jumbo frames. In Kubernetes, the pod's virtual ethernet interface MTU affects maximum packet size and must be compatible with the CNI plugin and underlying network.
+
+**`/sys/fs/cgroup/memory.max` (cgroups v2)**
+Memory limit for the cgroup. Contains a value in bytes or `max` (unlimited). The container runtime sets this when creating a container. Exceeding this limit triggers the OOM killer on the container's processes. This is the kernel mechanism behind Kubernetes memory limits.
+
+**`/sys/fs/cgroup/cpu.max` (cgroups v2)**
+CPU time limit as `$MAX $PERIOD` (in microseconds). `100000 100000` means 1 CPU. `200000 100000` means 2 CPUs. `max 100000` means unlimited. This is the kernel mechanism behind Kubernetes CPU limits.
+
+**`/sys/block/sda/queue/scheduler`**
+I/O scheduler for the block device. Reading shows available schedulers with the active one in brackets: `[mq-deadline] none`. Writable: `echo none > ...` disables scheduling (appropriate for NVMe, VMs with host-side scheduling).
+
+**`/sys/kernel/mm/transparent_hugepage/enabled`**
+Controls Transparent Huge Pages (THP). Values: `always`, `madvise`, `never`. Some databases (Redis, MongoDB) recommend `never` because THP can cause latency spikes. This is a common tuning point on Kubernetes nodes.
+
+#### How to Inspect and Investigate
+
+```bash
+# List network interfaces and their properties
+ls /sys/class/net/
+cat /sys/class/net/eth0/operstate
+cat /sys/class/net/eth0/speed
+
+# Check block device scheduler
+cat /sys/block/sda/queue/scheduler
+```
+
+```bash
+# Read cgroup resource limits (cgroups v2)
+cat /sys/fs/cgroup/system.slice/docker-*.scope/memory.max
+cat /sys/fs/cgroup/system.slice/docker-*.scope/cpu.max
+
+# View current cgroup memory usage
+cat /sys/fs/cgroup/system.slice/docker-*.scope/memory.current
+```
+
+```bash
+# List NUMA topology
+ls /sys/devices/system/node/
+cat /sys/devices/system/node/node0/meminfo
+
+# Check CPU frequency scaling governor
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+```
+
+```bash
+# Examine PCI device info
+lspci -v -s 00:1f.2
+ls /sys/bus/pci/devices/0000:00:1f.2/
+```
+
+**Debugging**:
+- Container resource limits: Check `/sys/fs/cgroup/` path for the container's scope.
+- Disk I/O performance: Check scheduler and queue depth in `/sys/block/<dev>/queue/`.
+- Network issues: Check `/sys/class/net/<iface>/operstate` and `carrier`.
+- THP latency: Check `/sys/kernel/mm/transparent_hugepage/enabled`.
+
+#### Permission Patterns
+
+- Most files: readable by all, writable only by root.
+- Some sensitive files (security, power management) are root-only even for reads.
+
+#### Security Considerations
+
+- Writing to sysfs can change hardware behavior, disable CPUs, modify memory management, and alter network configurations. Container runtimes restrict sysfs access.
+- In containers, `/sys` is typically mounted read-only. Only `/sys/fs/cgroup` is mounted read-write (for the container's own cgroup subtree).
+- Privileged containers with writable `/sys` access can modify host hardware settings, change kernel parameters, and perform device passthrough. This is a container escape vector.
+- SELinux labels sysfs entries with `sysfs_t` and subtypes.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- Containers see a filtered `/sys`. The cgroup subtree for the container is mounted at `/sys/fs/cgroup/`.
+- Kubernetes resource limits (CPU, memory) are implemented via cgroup files in `/sys/fs/cgroup/`. The kubelet writes to these when creating containers.
+- The device plugin framework in Kubernetes exposes specific `/sys` entries to pods that need hardware access (GPUs, FPGAs, SR-IOV interfaces).
+- Node tuning operators (OpenShift Node Tuning Operator, sysctl DaemonSets) modify `/sys` files on nodes for performance optimization.
+- cgroups v2 unified hierarchy (default on Ubuntu 22.04+, Fedora 31+, RHEL 9+) changes the path structure from v1's per-controller directories to a single tree.
+
+#### Common Misconceptions
+
+- **"/sys and /proc overlap."** Some information is available in both, but they serve different purposes. `/proc` is process-centric and predates the device model. `/sys` is device/subsystem-centric and structured by kernel object relationships. New kernel interfaces should use `/sys`.
+- **"sysfs files are just for reading."** Many sysfs attributes are writable, serving as the kernel's tuning interface. But they are ephemeral: values reset to defaults on reboot.
+
+---
+
+### `/tmp`
+
+**DIRECTORY: /tmp**
+
+#### Purpose and Design Intent
+
+`/tmp` provides a world-writable location for temporary files. Any user or process can create files here. Files are expected to be transient and may be cleaned automatically (by `tmpwatch`, `systemd-tmpfiles-clean.timer`, or reboot if `/tmp` is a tmpfs).
+
+The FHS mandates that programs should not assume files in `/tmp` will persist across invocations.
+
+#### What Type of Data Lives Here
+
+- Temporary files created by applications (compilers, editors, scripts)
+- Socket files for local IPC
+- Lock files (though `/run/lock` is preferred)
+- Ephemeral, world-writable
+
+#### Typical Subdirectories
+
+`/tmp` has no defined subdirectory structure. Contents are arbitrary and transient.
+
+```
+/tmp/
+├── systemd-private-*-nginx.service-*/   private /tmp for services
+│   └── tmp/
+├── ssh-XXXXXXXXXX/                      SSH agent socket directories
+├── .X11-unix/                           X11 display sockets
+│   └── X0
+└── (arbitrary application temp files)
+```
+
+#### Real File Examples
+
+**`/tmp/systemd-private-*-<service>-*/tmp/`**
+When a systemd service has `PrivateTmp=yes`, it gets an isolated `/tmp` that is bind-mounted from this location. The service sees `/tmp` but writes go to this private directory. Other processes cannot see or access the service's temp files. This is a significant security feature.
+
+**`/tmp/.X11-unix/X0`**
+Unix domain socket for X11 display `:0`. Used for GUI application communication with the X server. In containers running GUI applications, this socket must be shared from the host.
+
+#### How to Inspect and Investigate
+
+```bash
+# Check if /tmp is tmpfs or disk-backed
+findmnt /tmp
+# tmpfs output: tmpfs on /tmp type tmpfs
+# disk output:  /dev/sda1 on / type ext4 (and /tmp is just a directory on root)
+
+mount | grep /tmp
+```
+
+```bash
+# List files with ownership
+ls -la /tmp/
+
+# Find large temp files
+find /tmp -type f -size +100M -ls
+```
+
+#### Permission Patterns
+
+- `/tmp` directory: `1777` (sticky bit set). The sticky bit ensures users can only delete their own files, even though the directory is world-writable.
+- Files within: created with the user's default umask.
+
+#### Security Considerations
+
+- Sticky bit (`1777`) is critical. Without it, any user can delete or rename any other user's temp files (symlink attacks, race conditions).
+- `/tmp` is a common location for exploit payloads. Mount with `noexec,nosuid,nodev` to mitigate: `tmpfs /tmp tmpfs defaults,noexec,nosuid,nodev 0 0`.
+- `PrivateTmp=yes` in systemd units isolates service temp files, preventing cross-service temp file attacks.
+- Predictable temp filenames are a vulnerability (TOCTOU race conditions). Use `mktemp` to create temp files safely.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- In containers, `/tmp` is part of the overlay writable layer by default. For better performance and to avoid filling the overlay, mount an `emptyDir` volume at `/tmp` in Kubernetes.
+- `emptyDir` with `medium: Memory` backs `/tmp` with tmpfs, which is fast but counts against the container's memory limit in Kubernetes.
+- Kubernetes `emptyDir` volumes at `/tmp` are cleaned up when the pod is deleted.
+- Some security-hardened container runtimes mount `/tmp` with `noexec`.
+
+#### Common Misconceptions
+
+- **"/tmp is always a tmpfs."** Not necessarily. Some distributions mount `/tmp` as tmpfs (Fedora, Arch); others leave it as a directory on the root filesystem (Ubuntu, by default). Check with `findmnt /tmp`. systemd provides `tmp.mount` to enable tmpfs for `/tmp`, but it may not be enabled by default.
+- **"Files in /tmp persist until reboot."** `systemd-tmpfiles-clean.timer` cleans files older than 10 days by default (configured in `/usr/lib/tmpfiles.d/tmp.conf`). `tmpwatch` does similar on RHEL.
+
+---
+
+### `/usr`
+
+**DIRECTORY: /usr**
+
+#### Purpose and Design Intent
+
+`/usr` ("Unix System Resources") is the secondary hierarchy containing the majority of user utilities, applications, libraries, and documentation. In the traditional layout, `/usr` could be on a separate partition, potentially read-only or NFS-mounted, shared across machines. The root filesystem (`/`, `/bin`, `/sbin`, `/lib`) contained only what was needed to boot and mount `/usr`.
+
+Modern systems have largely completed the **usr-merge**: `/bin`, `/sbin`, `/lib`, and `/lib64` at the root are symlinks into `/usr/`. This simplifies the system and enables a read-only root filesystem with `/usr` as the single location for OS binaries and libraries.
+
+#### What Type of Data Lives Here
+
+- Binaries (commands, applications)
+- Libraries (shared objects, static archives)
+- Include headers
+- Architecture-independent data (man pages, documentation, icons, locale)
+- Static, persistent, package-manager-managed
+- Entire subtree can be mounted read-only
+
+#### Typical Subdirectories
+
+```
+/usr/
+├── bin/                           user commands (merged with /bin)
+│   ├── awk
+│   ├── curl
+│   ├── docker
+│   ├── find
+│   ├── gcc
+│   ├── git
+│   ├── kubectl
+│   ├── make
+│   ├── python3
+│   ├── ssh
+│   ├── systemctl
+│   ├── vim
+│   └── ...
+├── include/                       C/C++ header files
+│   ├── linux/                     kernel UAPI headers
+│   ├── stdio.h
+│   └── sys/
+├── lib/                           libraries and internal binaries
+│   ├── apt/                       APT internals (Debian)
+│   ├── dpkg/                      dpkg internals (Debian)
+│   ├── grub/                      GRUB modules
+│   ├── modules/                   kernel modules (on merged-/usr)
+│   ├── python3/                   Python standard library + packages
+│   ├── systemd/
+│   │   ├── system/                vendor systemd unit files
+│   │   │   ├── multi-user.target.wants/
+│   │   │   ├── sshd.service
+│   │   │   ├── docker.service
+│   │   │   └── kubelet.service
+│   │   ├── system-generators/     systemd generators
+│   │   ├── system-preset/         service enable/disable presets
+│   │   └── user/                  user-session unit files
+│   └── x86_64-linux-gnu/          multiarch libraries (Debian)
+├── lib64/                         64-bit libraries (RHEL/Fedora)
+├── libexec/                       internal helper binaries
+│   ├── docker/
+│   └── openssh/
+│       └── sftp-server
+├── local/                         locally installed software
+│   ├── bin/                       local binaries (highest $PATH priority)
+│   ├── etc/                       local configuration
+│   ├── include/                   local headers
+│   ├── lib/                       local libraries
+│   ├── sbin/                      local admin binaries
+│   └── share/
+│       └── man/                   local man pages
+├── sbin/                          admin commands (merged with /sbin)
+│   ├── adduser
+│   ├── cron
+│   ├── groupadd
+│   ├── iptables
+│   ├── nginx
+│   ├── nft
+│   ├── sshd
+│   ├── tcpdump
+│   ├── useradd
+│   └── visudo
+├── share/                         architecture-independent data
+│   ├── bash-completion/
+│   ├── doc/                       package documentation
+│   ├── man/                       manual pages
+│   │   ├── man1/                  user commands
+│   │   ├── man5/                  file formats
+│   │   └── man8/                  admin commands
+│   ├── info/                      GNU info pages
+│   ├── locale/                    internationalization data
+│   ├── terminfo/                  terminal descriptions
+│   └── zoneinfo/                  timezone data
+│       ├── America/
+│       ├── Europe/
+│       └── UTC
+└── src/                           source code (kernel headers, etc.)
+    └── linux-headers-$(uname -r)/
+```
+
+#### Real File Examples
+
+**`/usr/lib/systemd/system/docker.service`**
+The systemd unit file for Docker, installed by the Docker package. Defines how `dockerd` starts, its dependencies, and its sandboxing. Administrator overrides go in `/etc/systemd/system/docker.service.d/override.conf` (created by `systemctl edit docker`). The vendor file should not be modified directly.
+
+**`/usr/lib/systemd/system/kubelet.service`**
+The kubelet systemd unit. Installed by the kubelet package. On managed Kubernetes nodes, this is often customized with drop-in files in `/etc/systemd/system/kubelet.service.d/` that set node-specific flags (cloud provider, cgroup driver, pod CIDR).
+
+**`/usr/share/zoneinfo/`**
+Timezone database (tz data). Contains binary timezone files. `/etc/localtime` is a symlink (or copy) of the appropriate file here. In containers, timezone is set by bind-mounting or copying from here. Kubernetes pods inherit the node's timezone unless overridden with a volume mount.
+
+**`/usr/local/bin/`**
+The standard location for locally-installed binaries (not managed by the distribution's package manager). Has higher priority in `$PATH` than `/usr/bin`. Often used for: `kubectl` downloaded directly, custom scripts, `helm`, `terraform`, and other tools installed outside the package manager.
+
+**`/usr/lib/python3/dist-packages/` (Debian) / `/usr/lib/python3.X/site-packages/` (RHEL)**
+Python packages installed system-wide by the package manager. `pip install --system` also writes here. Python virtual environments (`venv`) have their own `site-packages` elsewhere.
+
+**`/usr/include/linux/`**
+Kernel userspace API (UAPI) headers. These define the interfaces between the kernel and userspace (syscall numbers, ioctl definitions, data structures). Used at compile time, not runtime.
+
+#### How to Inspect and Investigate
+
+```bash
+# Check if /usr merge is in effect
+ls -ld /bin /sbin /lib
+# Merged: lrwxrwxrwx 1 root root 7 ... /bin -> usr/bin
+# Traditional: drwxr-xr-x 2 root root 4096 ... /bin
+
+# Show package owning a binary (Debian)
+dpkg -S /usr/bin/curl
+# Output: curl: /usr/bin/curl
+```
+
+```bash
+# List all systemd unit files from packages
+systemctl list-unit-files --type=service | head -20
+
+# Show the effective unit file for a service (resolving overrides)
+systemctl cat docker.service
+```
+
+```bash
+# Check /usr filesystem and mount options
+findmnt /usr
+# On systems with read-only /usr: ro mount option present
+
+# Show disk usage of /usr
+du -sh /usr/*/
+```
+
+**Debugging**:
+- Missing libraries: `ldconfig -p | grep <libname>` to search the linker cache. Run `ldconfig` after installing new libraries.
+- Broken systemd units: `systemctl status <service>`, `journalctl -u <service>`, `systemd-analyze verify <unit>`.
+- Wrong timezone: `readlink /etc/localtime`, compare with `/usr/share/zoneinfo/`.
+
+#### Permission Patterns
+
+- Binaries: `0755`, owned by `root:root`.
+- Libraries: `0755` or `0644`.
+- Share data: `0644` for files, `0755` for directories.
+- `/usr/local/`: same patterns, but often modified by the local administrator.
+
+#### Security Considerations
+
+- `/usr` should be mounted read-only where possible. This prevents runtime modification of system binaries (immutable infrastructure pattern).
+- Package manager operations temporarily remount `/usr` read-write (or work through overlays).
+- On SELinux systems, binaries in `/usr` have specific type labels (`bin_t`, `sshd_exec_t`, `httpd_exec_t`) that determine which domains can execute them.
+- `/usr/local/bin` is a common target for backdoor installation because it is earlier in `$PATH` than `/usr/bin`.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- Container images contain their own `/usr`. The image's package manager populated `/usr` during the image build.
+- Read-only root filesystem in Kubernetes (`readOnlyRootFilesystem: true` in the security context) makes `/usr` unwritable at runtime, enforcing immutability.
+- Distroless images contain only the runtime libraries in `/usr/lib` needed by the application. `/usr/bin` is empty or absent.
+- On container-optimized OS (Flatcar, Bottlerocket, Talos), `/usr` is a read-only image that is atomically updated. There is no package manager.
+- `/usr/share/zoneinfo` must be available in the container for timezone-dependent applications. Many minimal images omit it, causing timezone errors.
+
+#### Common Misconceptions
+
+- **"/usr stands for 'user'."** It historically held user home directories but was repurposed. The acronym "Unix System Resources" is a backronym. The FHS defines it as "the secondary hierarchy."
+- **"/usr/local is for locally compiled software."** It is for any software installed outside the distribution's package manager, whether compiled from source, downloaded as a binary, or installed by a third-party installer.
+- **"Editing files in /usr/lib/systemd/system/ is the right way to customize a service."** No. Package upgrades overwrite these files. Use `/etc/systemd/system/` for overrides or `systemctl edit <service>` for drop-in files.
+
+---
+
+### `/var`
+
+**DIRECTORY: /var**
+
+#### Purpose and Design Intent
+
+`/var` contains variable data that changes during system operation: logs, spool directories, caches, transient state, and application runtime data. Unlike `/usr` (static, shareable), `/var` is host-specific and constantly changing.
+
+The name comes from "variable." This directory grows over time and is one of the most common causes of disk space exhaustion.
+
+#### What Type of Data Lives Here
+
+- Log files (text, binary journal)
+- Mail spools
+- Print spools
+- Package manager caches and databases
+- Application state databases
+- Transient data that must persist across reboots (unlike `/run` which does not)
+
+#### Typical Subdirectories
+
+```
+/var/
+├── backups/                       system backup files (Debian)
+├── cache/                         application cache data
+│   ├── apt/                       APT package cache (Debian)
+│   │   └── archives/              downloaded .deb files
+│   ├── dnf/                       DNF cache (RHEL/Fedora)
+│   ├── fontconfig/
+│   ├── ldconfig/                  linker cache
+│   └── man/                       formatted man page cache
+├── crash/                         crash dump files
+├── lib/                           variable state data for applications
+│   ├── apt/                       APT state (Debian)
+│   │   ├── lists/                 package index files
+│   │   └── extended_states
+│   ├── cloud/                     cloud-init state
+│   │   └── instance/
+│   ├── containerd/                containerd state and images
+│   │   └── io.containerd.snapshotter.v1.overlayfs/
+│   ├── docker/                    Docker data root
+│   │   ├── containers/            container runtime data
+│   │   ├── image/                 image metadata
+│   │   ├── network/               Docker network state
+│   │   ├── overlay2/              overlay2 storage driver layers
+│   │   └── volumes/               Docker-managed volumes
+│   ├── dpkg/                      dpkg database (Debian)
+│   │   ├── info/                  per-package metadata
+│   │   └── status                 package status database
+│   ├── kubelet/                   kubelet state
+│   │   ├── config.yaml
+│   │   ├── pki/                   kubelet certificates
+│   │   ├── plugins/               CSI plugins
+│   │   ├── pod-resources/
+│   │   └── pods/                  active pod data
+│   │       └── <pod-uid>/
+│   │           └── volumes/
+│   │               ├── kubernetes.io~configmap/
+│   │               ├── kubernetes.io~projected/
+│   │               └── kubernetes.io~secret/
+│   ├── misc/
+│   ├── rpm/                       RPM database (RHEL)
+│   ├── systemd/
+│   │   └── timers/                persistent timer state
+│   └── ucf/                       UCF state (Debian)
+├── local/                         local variable data
+├── lock -> /run/lock              lock files (symlink)
+├── log/                           log files
+│   ├── alternatives.log
+│   ├── apt/                       APT transaction logs
+│   ├── auth.log                   authentication log (Debian)
+│   ├── btmp                       failed login attempts (binary)
+│   ├── cloud-init.log
+│   ├── cloud-init-output.log
+│   ├── dmesg                      boot kernel messages
+│   ├── journal/                   systemd journal (binary)
+│   │   └── <machine-id>/
+│   │       ├── system.journal     persistent journal
+│   │       └── user-1000.journal  user journal
+│   ├── kern.log                   kernel messages (Debian)
+│   ├── lastlog                    last login records (binary)
+│   ├── nginx/
+│   │   ├── access.log
+│   │   └── error.log
+│   ├── secure                     authentication log (RHEL)
+│   ├── syslog                     system log (Debian)
+│   ├── messages                   system log (RHEL)
+│   └── wtmp                       login records (binary)
+├── mail/                          user mailboxes
+├── opt/                           variable data for /opt packages
+├── run -> /run                    runtime data (symlink)
+├── spool/                         spool directories
+│   ├── cron/
+│   │   └── crontabs/              user crontabs
+│   ├── mail -> ../mail
+│   └── postfix/                   Postfix mail queue
+├── tmp/                           persistent temp files (survives reboot)
+└── www/                           web server data (Debian convention)
+    └── html/
+        └── index.html
+```
+
+#### Real File Examples
+
+**`/var/log/syslog` (Debian) / `/var/log/messages` (RHEL)**
+The traditional system log. Contains messages from the kernel, system services, and applications via syslog(3). Rotated by `logrotate`. On systemd systems, this file may be generated by `rsyslog` reading from the systemd journal. Some systems disable these text logs entirely and rely solely on `journalctl`.
+
+**`/var/log/journal/<machine-id>/system.journal`**
+The systemd journal. Binary format, indexed for fast querying. Read with `journalctl`. Contains structured log data with metadata (unit name, priority, PID, etc.). If `/var/log/journal/` exists and is persistent storage, logs survive reboot. If it does not exist, logs go to `/run/log/journal/` (volatile, lost on reboot).
+
+**`/var/lib/docker/overlay2/`**
+Docker's overlay2 storage driver data. Contains filesystem layers for images and containers. Each layer is a directory with `diff/` (layer contents), `link` (shortened ID), `lower` (parent layers), `merged/` (union view, only for running containers), and `work/` (overlay internal). This is where the majority of Docker's disk usage occurs.
+
+**`/var/lib/kubelet/pods/<pod-uid>/volumes/`**
+Mounted volumes for a Kubernetes pod. Subdirectories correspond to volume plugins (`kubernetes.io~secret`, `kubernetes.io~configmap`, `kubernetes.io~projected`, CSI driver names). The kubelet manages this directory tree. When a pod is deleted, these directories are cleaned up.
+
+**`/var/lib/dpkg/status` (Debian) / `/var/lib/rpm/` (RHEL)**
+The package manager database. On Debian, `/var/lib/dpkg/status` is a text file listing every installed package, its version, dependencies, and state. On RHEL, `/var/lib/rpm/` contains an RPM database (Berkeley DB or SQLite). Corruption of these databases makes the package manager non-functional.
+
+**`/var/cache/apt/archives/` (Debian) / `/var/cache/dnf/` (RHEL)**
+Downloaded package files. `apt clean` or `dnf clean all` removes these to reclaim space. In Docker builds, `RUN apt-get update && apt-get install -y ... && rm -rf /var/lib/apt/lists/*` is a common pattern to reduce image size.
+
+#### How to Inspect and Investigate
+
+```bash
+# Check disk usage of /var subdirectories
+du -sh /var/*/
+du -sh /var/lib/docker/
+
+# Find large log files
+find /var/log -type f -size +100M -ls
+```
+
+```bash
+# Read systemd journal for a specific service
+journalctl -u kubelet --since "1 hour ago" --no-pager | tail -50
+
+# Check journal disk usage
+journalctl --disk-usage
+```
+
+```bash
+# Check Docker disk usage
+docker system df
+docker system df -v
+
+# Check package manager database integrity (Debian)
+dpkg --audit
+```
+
+```bash
+# View logrotate status
+cat /var/lib/logrotate/status
+
+# Check spool directories
+ls -la /var/spool/cron/crontabs/
+```
+
+**Debugging**:
+- Disk full: `/var/log` and `/var/lib/docker` are the most common offenders. Check with `du -sh /var/*/`. Clean logs with `journalctl --vacuum-size=500M`. Clean Docker with `docker system prune`.
+- Package manager broken: Back up and rebuild the database. Debian: `dpkg --configure -a`. RHEL: `rpm --rebuilddb`.
+- Missing logs: Check if journald is configured for persistent storage (`/var/log/journal/` directory must exist with correct permissions).
+
+#### Permission Patterns
+
+- `/var/log/`: `0755`, logs within are `0640` (readable by `adm` group on Debian) or `0600`.
+- `/var/log/journal/`: `2755` (setgid), owned by `root:systemd-journal`. Users in `systemd-journal` group can read logs.
+- `/var/lib/<app>/`: typically owned by the application's system user.
+- `/var/cache/`: `0755`, cache entries owned by the caching service.
+- `/var/spool/cron/crontabs/`: `0700`, individual crontabs `0600`, owned by the user.
+
+#### Security Considerations
+
+- Log files may contain sensitive information (authentication attempts, stack traces with secrets, query logs). Restrict access.
+- `/var/lib/docker/` contains all container data, including secrets mounted into containers. Protect with filesystem permissions and encryption.
+- `btmp` and `wtmp` are binary logs recording login attempts. Attackers may truncate these to hide their tracks. Use `lastb` and `last` to read them.
+- SELinux labels: `var_log_t`, `docker_var_lib_t`, `var_spool_t`.
+- Log injection: Untrusted input written to logs can be exploited by log analysis tools. The journal's structured logging reduces this risk.
+
+#### Cloud / Container / Kubernetes Relevance
+
+- `/var/lib/docker/` or `/var/lib/containerd/` on Kubernetes nodes holds all container images and writable layers. Running out of space here causes `ImagePull` failures and container evictions. Monitor with `kubelet` garbage collection thresholds.
+- `/var/lib/kubelet/` is the kubelet's primary state directory. If it is on a separate filesystem, it needs adequate space for volumes, pods, and plugins.
+- `/var/log/pods/` (or `/var/log/containers/`) contains symlinks to container log files, used by log aggregators (Fluentd, Fluent Bit, Filebeat) running as DaemonSets. These read container stdout/stderr logs via these paths.
+- Container images should not write to `/var/log` for application logs. Use stdout/stderr (12-factor app methodology) and let the container runtime handle log collection.
+- `/var/cache/` in container images is dead weight. Clean caches in Dockerfiles.
+- Ephemeral storage limits in Kubernetes (`ephemeral-storage` resource) cap the total writable layer + emptyDir usage per pod, which includes writes to `/var` inside the container.
+
+#### Common Misconceptions
+
+- **"/var/run still exists as a real directory."** On modern systems, `/var/run` is a symlink to `/run`. Old documentation and scripts reference `/var/run`; it works via the symlink.
+- **"Journal logs are either volatile or persistent."** It depends on whether `/var/log/journal/` exists. If it does (and has correct permissions), logs are persistent. Otherwise, they go to `/run/log/journal/` and are lost on reboot. `mkdir -p /var/log/journal && systemd-tmpfiles --create --prefix /var/log/journal` enables persistence.
+- **"I should store application data in /var."** Only system-level application state belongs in `/var/lib/<app>`. User-facing application data should be in `/home`, `/srv`, or dedicated mount points.
+
+---
+
+## Cross-Cutting Topics
+
+---
+
+### systemd Unit File Locations
+
+systemd loads unit files from multiple paths, with a well-defined priority order (highest to lowest):
+
+| Priority | Path | Purpose | Managed By |
+|----------|------|---------|------------|
+| 1 (highest) | `/etc/systemd/system/` | Administrator overrides | Admin |
+| 2 | `/run/systemd/system/` | Runtime-generated units | Generators, `systemd-run` |
+| 3 | `/usr/lib/systemd/system/` | Vendor/package units | Package manager |
+| 4 (lowest) | `/lib/systemd/system/` | Vendor/package units (Debian path) | Package manager |
+
+On merged-`/usr` systems, paths 3 and 4 are the same directory.
+
+#### Override Mechanism
+
+To customize a vendor unit without modifying it:
+
+```bash
+# Create a drop-in directory and override file
+systemctl edit docker.service
+# Creates: /etc/systemd/system/docker.service.d/override.conf
+```
+
+The drop-in file can contain only the directives you want to change. For example:
+
+```ini
+[Service]
+Environment="HTTP_PROXY=http://proxy:3128"
+```
+
+To completely replace a vendor unit:
+
+```bash
+# Copy and modify
+cp /usr/lib/systemd/system/docker.service /etc/systemd/system/docker.service
+# Edit /etc/systemd/system/docker.service
+```
+
+#### Target Files
+
+Targets group units and define synchronization points (analogous to SysV runlevels):
+
+| Target | Purpose |
+|--------|---------|
+| `default.target` | Boot target (usually symlink to multi-user or graphical) |
+| `multi-user.target` | Non-graphical multi-user system |
+| `graphical.target` | Graphical desktop |
+| `rescue.target` | Single-user rescue mode |
+| `emergency.target` | Minimal emergency shell |
+| `network-online.target` | Network is fully configured |
+| `timers.target` | All timers are ready |
+
+Units declare dependencies on targets with `WantedBy=` (in `[Install]`) and `After=`/`Requires=` (in `[Unit]`).
+
+#### User Units
+
+Per-user systemd units live in:
+
+- `~/.config/systemd/user/` (user-defined)
+- `/usr/lib/systemd/user/` (vendor-provided)
+- `/etc/systemd/user/` (admin overrides)
+
+Managed with `systemctl --user`.
+
+---
+
+### cgroups v1 vs v2 Path Differences
+
+Control groups (cgroups) limit, account for, and isolate resource usage of process groups. They are the foundation of container resource management.
+
+#### cgroups v1 (Legacy)
+
+Each resource controller has its own hierarchy, mounted separately:
+
+```
+/sys/fs/cgroup/
+├── blkio/                         block I/O throttling
+│   └── docker/<container-id>/
+│       ├── blkio.throttle.read_bps_device
+│       └── blkio.throttle.write_bps_device
+├── cpu,cpuacct/                   CPU time accounting and limits
+│   └── docker/<container-id>/
+│       ├── cpu.cfs_quota_us        CPU quota in microseconds
+│       ├── cpu.cfs_period_us       CPU period (default: 100000)
+│       ├── cpu.shares              relative CPU weight
+│       └── cpuacct.usage           total CPU time used (ns)
+├── cpuset/                        CPU and memory node assignment
+│   └── docker/<container-id>/
+│       ├── cpuset.cpus             assigned CPUs
+│       └── cpuset.mems             assigned NUMA nodes
+├── devices/                       device access control
+├── freezer/                       process freezing
+├── hugetlb/                       huge page limits
+├── memory/                        memory limits
+│   └── docker/<container-id>/
+│       ├── memory.limit_in_bytes   memory limit
+│       ├── memory.usage_in_bytes   current usage
+│       ├── memory.max_usage_in_bytes
+│       ├── memory.stat             detailed memory stats
+│       └── memory.oom_control      OOM killer behavior
+├── net_cls,net_prio/              network class/priority
+├── perf_event/                    perf event grouping
+├── pids/                          process count limits
+│   └── docker/<container-id>/
+│       ├── pids.current
+│       └── pids.max
+└── systemd/                       systemd's own hierarchy
+    └── docker/<container-id>/
+```
+
+#### cgroups v2 (Unified)
+
+A single hierarchy contains all controllers:
+
+```
+/sys/fs/cgroup/                    unified hierarchy root
+├── cgroup.controllers              available controllers at this level
+├── cgroup.subtree_control          controllers delegated to children
+├── cgroup.procs                    PIDs in this cgroup
+├── system.slice/                   system services
+│   ├── docker-<container-id>.scope/
+│   │   ├── cgroup.controllers
+│   │   ├── cgroup.procs
+│   │   ├── cpu.max                 "$MAX $PERIOD" (quota and period)
+│   │   ├── cpu.weight              relative CPU weight (1-10000, default 100)
+│   │   ├── cpu.stat                usage statistics
+│   │   ├── io.max                  I/O limits (per device)
+│   │   ├── memory.current          current memory usage
+│   │   ├── memory.max              memory limit (bytes or "max")
+│   │   ├── memory.swap.max         swap limit
+│   │   ├── memory.high             memory high watermark (throttling)
+│   │   ├── memory.stat             detailed breakdown
+│   │   ├── pids.current            current process count
+│   │   └── pids.max                process count limit
+│   └── kubelet.service/
+└── user.slice/
+    └── user-1000.slice/
+        └── session-1.scope/
+```
+
+#### Key Differences
+
+| Aspect | v1 | v2 |
+|--------|----|----|
+| Hierarchy | Per-controller | Single unified |
+| Mount point | `/sys/fs/cgroup/<controller>/` | `/sys/fs/cgroup/` |
+| CPU limit | `cpu.cfs_quota_us` / `cpu.cfs_period_us` | `cpu.max` ("$MAX $PERIOD") |
+| CPU weight | `cpu.shares` (2-262144, default 1024) | `cpu.weight` (1-10000, default 100) |
+| Memory limit | `memory.limit_in_bytes` | `memory.max` |
+| Memory current | `memory.usage_in_bytes` | `memory.current` |
+| I/O control | `blkio.throttle.*` | `io.max`, `io.weight` |
+| Process in multiple hierarchies | Yes (one cgroup per controller) | No (single cgroup) |
+| Delegation | Difficult and fragile | First-class support (delegate control to non-root) |
+| Pressure Stall Info | Not available | `cpu.pressure`, `memory.pressure`, `io.pressure` |
+
+#### Distribution Defaults
+
+- **cgroups v2 by default**: Ubuntu 22.04+, Fedora 31+, Debian 11+, RHEL 9+, Arch Linux
+- **cgroups v1 by default**: RHEL 7/8, Ubuntu 20.04, Debian 10
+- Switching: kernel parameter `systemd.unified_cgroup_hierarchy=1` (v2) or `systemd.unified_cgroup_hierarchy=0` (v1)
+
+#### Kubernetes Implications
+
+Kubernetes 1.25+ supports cgroups v2 natively. The kubelet must be configured with `--cgroup-driver=systemd` (recommended for both v1 and v2). Key behavioral differences:
+
+- Memory QoS (MemoryQoS feature gate) leverages `memory.high` in v2 for burstable workloads.
+- Swap accounting works differently in v2 (`memory.swap.max`).
+- Some older container runtimes and monitoring tools do not support v2.
+
+---
+
+### tmpfs Mounts and Ephemeral Runtime Storage
+
+`tmpfs` is a filesystem that stores data in virtual memory (RAM and swap). It provides POSIX filesystem semantics without any backing block device.
+
+#### Default tmpfs Mounts
+
+| Mount Point | Purpose | Typical Size |
+|-------------|---------|-------------|
+| `/run` | Runtime state, PID files, sockets | 10-25% of RAM |
+| `/dev/shm` | POSIX shared memory | 50% of RAM |
+| `/tmp` (if enabled) | Temporary files | 50% of RAM |
+| `/run/user/<uid>` | Per-user runtime | 10% of RAM or 256MB |
+| `/sys/fs/cgroup` | cgroup filesystem | N/A (not data storage) |
+
+#### Size Limits
+
+tmpfs default maximum size is 50% of physical RAM. Resize with mount options:
+
+```bash
+mount -t tmpfs -o size=2G tmpfs /tmp
+# Or in /etc/fstab:
+# tmpfs /tmp tmpfs defaults,size=2G,noexec,nosuid,nodev 0 0
+```
+
+tmpfs does not consume RAM until files are actually written. The `size=` parameter is a maximum, not a reservation. Under memory pressure, tmpfs contents can be swapped to disk.
+
+#### Container Context
+
+- Kubernetes `emptyDir` with `medium: Memory` creates a tmpfs volume. Its usage counts against the container's memory limit and is subject to eviction.
+- Docker `--tmpfs /tmp:rw,noexec,nosuid,size=100m` creates a tmpfs inside the container.
+- `emptyDir` with `sizeLimit` in Kubernetes caps the volume's usage and triggers pod eviction if exceeded.
+
+---
+
+### Traditional vs Merged-/usr Systems
+
+#### Traditional Layout
+
+```
+/bin          -> separate directory (essential binaries)
+/sbin         -> separate directory (essential admin binaries)
+/lib          -> separate directory (essential libraries)
+/lib64        -> separate directory (64-bit libraries)
+/usr/bin      -> all other binaries
+/usr/sbin     -> all other admin binaries
+/usr/lib      -> all other libraries
+```
+
+The rationale was that `/` was on a small, reliable disk, while `/usr` might be on a larger, separate partition or NFS mount.
+
+#### Merged-/usr Layout
+
+```
+/bin          -> symlink to /usr/bin
+/sbin         -> symlink to /usr/sbin
+/lib          -> symlink to /usr/lib
+/lib64        -> symlink to /usr/lib64 (if exists)
+```
+
+All binaries and libraries live under `/usr/`. The symlinks ensure backward compatibility: `/bin/bash` and `/usr/bin/bash` resolve to the same file.
+
+#### Distribution Status
+
+| Distribution | Merged-/usr | Since |
+|-------------|-------------|-------|
+| Fedora | Yes | Fedora 17 (2012) |
+| Arch Linux | Yes | 2012 |
+| Debian | Yes (default) | Debian 12 (2023) |
+| Ubuntu | Yes | Ubuntu 20.04 (symlinks existed, fully enforced later) |
+| RHEL | Yes | RHEL 7+ |
+| openSUSE | Yes | 2012 |
+
+#### Benefits
+
+- Simplifies initramfs (no need to determine which binaries are "essential")
+- Enables read-only `/usr` (atomic OS updates: ostree, A/B partition schemes)
+- Eliminates confusing questions about where a binary "should" go
+- Required by modern OS designs (Fedora CoreOS, Flatcar, Bottlerocket)
+
+#### Impact on Package Managers
+
+Package managers on merged-`/usr` systems install all binaries to `/usr/bin` and `/usr/sbin`. The compatibility symlinks are maintained by the base-files package (or equivalent). Scripts referencing `/bin/bash` continue to work.
+
+---
+
+### Package Manager Interaction
+
+#### Debian/Ubuntu (dpkg/apt)
+
+- Package database: `/var/lib/dpkg/status` (text file, one stanza per package)
+- Package metadata: `/var/lib/dpkg/info/<package>.{list,md5sums,conffiles,preinst,postinst,prerm,postrm}`
+- Downloaded packages: `/var/cache/apt/archives/`
+- Repository indexes: `/var/lib/apt/lists/`
+- Repository configuration: `/etc/apt/sources.list`, `/etc/apt/sources.list.d/`
+- APT configuration: `/etc/apt/apt.conf.d/`
+
+Key commands:
+```bash
+dpkg -S /path/to/file    # which package owns this file
+dpkg -L package           # list files installed by package
+dpkg --verify package     # verify file integrity
+apt-file search filename  # search all packages for a file
+```
+
+#### RHEL/Fedora (rpm/dnf/yum)
+
+- Package database: `/var/lib/rpm/` (BerkeleyDB or SQLite)
+- Downloaded packages: `/var/cache/dnf/`
+- Repository configuration: `/etc/yum.repos.d/`
+- DNF configuration: `/etc/dnf/dnf.conf`
+
+Key commands:
+```bash
+rpm -qf /path/to/file    # which package owns this file
+rpm -ql package           # list files installed by package
+rpm -V package            # verify file integrity (mode, size, hash, symlinks)
+dnf provides /path        # find which package provides a file
+```
+
+#### Configuration File Handling
+
+Both systems distinguish between configuration files and regular files:
+
+- **dpkg**: Files listed in `conffiles` are configuration. On upgrade, dpkg asks whether to keep the local version or install the new one. Modified conffiles are detected by comparing md5sums.
+- **rpm**: `%config` files are preserved on upgrade. `%config(noreplace)` keeps the user's version and installs the new one as `.rpmnew`. If the user has not modified the file, it is replaced silently.
+
+---
+
+### `/etc/fstab` Deep Explanation
+
+`/etc/fstab` (filesystem table) is a text file that defines how disk partitions, block devices, and remote filesystems should be mounted at boot time. systemd's fstab-generator reads this file and creates mount units.
+
+#### Format
+
+Each line has six whitespace-separated fields:
+
+```
+<device>  <mountpoint>  <type>  <options>  <dump>  <fsck-order>
+```
+
+| Field | Description |
+|-------|-------------|
+| device | Block device, UUID, LABEL, or remote path. `UUID=xxxx` is preferred over `/dev/sdX` for stability. |
+| mountpoint | Directory where the filesystem is mounted. Must exist (or systemd creates it). |
+| type | Filesystem type: `ext4`, `xfs`, `btrfs`, `vfat`, `tmpfs`, `nfs`, `swap`, etc. |
+| options | Comma-separated mount options (see below). |
+| dump | Used by `dump` backup utility. `0` = don't dump. Effectively obsolete. |
+| fsck-order | fsck check order at boot. `0` = don't check. `1` = root filesystem. `2` = other filesystems. |
+
+#### Common Mount Options
+
+| Option | Effect |
+|--------|--------|
+| `defaults` | Equivalent to `rw,suid,dev,exec,auto,nouser,async` |
+| `ro` | Read-only |
+| `rw` | Read-write |
+| `noexec` | Prevent execution of binaries |
+| `nosuid` | Ignore suid/sgid bits |
+| `nodev` | Ignore device nodes |
+| `noatime` | Don't update access time (performance) |
+| `relatime` | Update atime only if older than mtime (default since kernel 2.6.30) |
+| `discard` | Enable TRIM for SSDs |
+| `nofail` | Don't fail boot if device is absent |
+| `x-systemd.automount` | Automount on first access |
+| `x-systemd.device-timeout=30s` | Timeout waiting for device |
+| `_netdev` | Wait for network before mounting |
+| `errors=remount-ro` | Remount read-only on errors (ext4) |
+| `barrier=1` | Enable write barriers (data integrity) |
+| `commit=5` | Sync interval in seconds |
+
+#### Example fstab
+
+```
+# <device>                                 <mount>    <type>  <options>                       <dump> <fsck>
+UUID=a1b2c3d4-5678-90ab-cdef-1234567890ab  /          ext4    errors=remount-ro,relatime       0      1
+UUID=b2c3d4e5-6789-0abc-def1-234567890abc  /boot      ext4    defaults                         0      2
+UUID=C0FF-EE42                             /boot/efi  vfat    umask=0077                       0      1
+UUID=d3e4f5a6-7890-abcd-ef12-34567890abcd  swap       swap    defaults                         0      0
+tmpfs                                      /tmp       tmpfs   defaults,noexec,nosuid,nodev,size=2G 0  0
+192.168.1.100:/export                      /mnt/nfs   nfs     defaults,_netdev,nofail          0      0
+```
+
+#### systemd Integration
+
+systemd's `systemd-fstab-generator` converts fstab entries into systemd `.mount` units at boot:
+
+- `/` becomes `-.mount`
+- `/boot` becomes `boot.mount`
+- `/tmp` becomes `tmp.mount`
+
+These generated units appear in `/run/systemd/generator/`. You can also create `.mount` units directly in `/etc/systemd/system/` for more control (dependencies, ordering, conditions).
+
+#### Debugging
+
+```bash
+# Test fstab syntax without rebooting
+mount -a              # attempt to mount all fstab entries
+findmnt --verify      # verify fstab (systemd 247+)
+
+# Check systemd's interpretation of fstab
+systemctl list-units --type=mount
+
+# View generated mount unit
+systemctl cat boot.mount
+```
+
+A syntax error in fstab can prevent the system from booting. Always test changes before rebooting. The `nofail` option is critical for optional mounts (cloud volumes that may not be attached, NFS shares that may be unavailable).
+
+---
+
+### Mount Namespaces and chroot
+
+#### chroot
+
+`chroot(2)` changes the calling process's root directory. Processes inside a chroot see a different filesystem root, but this is a weak isolation mechanism:
+
+- Does not isolate process IDs, network, users, or other resources
+- Root inside the chroot can break out (`chroot("../..")`, `mknod`, `mount`)
+- Does not unmount or hide the original filesystem
+- Useful for repair operations (boot from rescue media, chroot into installed system)
+
+```bash
+# Repair a system from rescue media
+mount /dev/sda1 /mnt
+mount --bind /dev /mnt/dev
+mount --bind /proc /mnt/proc
+mount --bind /sys /mnt/sys
+chroot /mnt /bin/bash
+# Now operating within the installed system's filesystem
+```
+
+#### Mount Namespaces
+
+Mount namespaces (Linux 2.4.19+) provide per-process filesystem mount tables. Each namespace has its own set of mounts, isolated from other namespaces.
+
+- Created with `clone(CLONE_NEWNS)` or `unshare(CLONE_NEWNS)`
+- New namespace starts as a copy of the parent's mount table
+- Subsequent mounts/unmounts in one namespace are invisible to others
+- Mount propagation (shared, slave, private) controls cross-namespace visibility
+
+This is the foundation of container filesystem isolation. Container runtimes:
+
+1. Create a new mount namespace
+2. Set up the container's root filesystem (overlayfs)
+3. Mount `/proc`, `/sys`, `/dev` inside the container
+4. Bind-mount specific volumes
+5. `pivot_root()` to make the container filesystem the root
+6. Unmount the old root
+
+#### Inspecting Namespaces
+
+```bash
+# View a process's mount namespace
+readlink /proc/<pid>/ns/mnt
+# Processes in the same namespace show the same inode number
+
+# View a process's mounts
+cat /proc/<pid>/mountinfo
+
+# Enter another process's mount namespace
+nsenter --target <pid> --mount
+
+# List all mount namespaces
+lsns --type mnt
+```
+
+#### Kubernetes Context
+
+Every pod in Kubernetes runs in its own mount namespace. This provides:
+
+- Isolated filesystem root (container image as /)
+- Volume mounts visible only to the pod
+- `/proc` and `/sys` isolation (via PID and cgroup namespaces, mounted in the mount namespace)
+
+`hostPath` volumes break this isolation by bind-mounting host directories into the pod's mount namespace. `mountPropagation: Bidirectional` in Kubernetes allows mounts created inside a pod to propagate to the host, which is required by some CSI drivers but is a security risk.
+
+---
+
+*End of reference.*

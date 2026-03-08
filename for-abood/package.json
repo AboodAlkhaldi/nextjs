@@ -1,0 +1,26 @@
+{
+  "name": "llm-generated-references",
+  "version": "0.0.1",
+  "description": "LLM Generated References",
+  "scripts": {
+    "dev": "next dev --turbopack",
+    "build": "next build",
+    "postbuild": "pagefind --site .next/server/app --output-path public/_pagefind",
+    "start": "next start"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "next": "^16",
+    "nextra": "^4",
+    "nextra-theme-docs": "^4",
+    "react": "^19",
+    "react-dom": "^19"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "pagefind": "^1",
+    "typescript": "^5"
+  }
+}

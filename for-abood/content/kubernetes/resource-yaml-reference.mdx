@@ -1,0 +1,3066 @@
+---
+title: Resource YAML Reference
+sidebarTitle: Resource YAML Reference
+---
+
+# Complete Kubernetes Resource YAML Reference
+
+> **Purpose:** This is a 100% complete field-level reference for the most important Kubernetes resource types.
+> Every field is included — including optional, advanced, and rarely-used fields.
+> Fields with multiple valid options show all alternatives as commented-out lines.
+> The `status` block is included for each resource (server-managed, not set by users).
+
+---
+
+# Table of Contents
+
+1. [Pod](#1-pod)
+2. [Deployment](#2-deployment)
+3. [StatefulSet](#3-statefulset)
+4. [Service](#4-service)
+5. [PersistentVolume (PV)](#5-persistentvolume-pv)
+6. [PersistentVolumeClaim (PVC)](#6-persistentvolumeclaim-pvc)
+7. [Node](#7-node)
+
+---
+
+## 1. Pod
+
+A Pod is the smallest deployable unit in Kubernetes. It represents one or more containers that share network namespace, storage, and a lifecycle.
+Pods are ephemeral by nature — they are not self-healing. Use a Deployment or StatefulSet to manage Pods in production.
+
+```yaml
+# ============================================================
+# POD — Complete Field Reference
+# ============================================================
+
+# apiVersion specifies the Kubernetes API version for this resource.
+# For core resources like Pod, use "v1". Other resources may use apps/v1, batch/v1, etc.
+apiVersion: v1
+
+# kind declares the type of Kubernetes object being defined.
+# This tells the API server which schema and controller to use for this manifest.
+kind: Pod
+
+# -------------------------------------------------------
+# METADATA — identity and organizational fields
+# -------------------------------------------------------
+metadata:
+
+  # name is the unique identifier of this Pod within its namespace.
+  # Must be DNS-label compliant: lowercase alphanumeric or '-', max 253 chars.
+  name: my-app-pod
+
+  # generateName is a prefix used by the server to generate a unique name if name is not set.
+  # The server appends a random suffix to this prefix. Mutually exclusive with a fixed name.
+  generateName: my-app-
+
+  # namespace scopes the Pod within a logical partition of the cluster.
+  # If omitted, defaults to "default". Pods in different namespaces are isolated by policy.
+  namespace: my-namespace
+
+  # labels are key/value pairs used for identification, grouping, and selection.
+  # Services, Deployments, and NetworkPolicies use label selectors to target Pods.
+  labels:
+    app: my-app
+    version: "1.0.0"
+    environment: production
+    tier: backend
+
+  # annotations are arbitrary key/value metadata not used for selection.
+  # Used by tools, operators, and humans for documentation, config injection, or monitoring hints.
+  annotations:
+    description: "Primary application pod for the my-app service"
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    kubectl.kubernetes.io/last-applied-configuration: "{}"
+
+  # finalizers are strings that prevent object deletion until specific cleanup is done.
+  # A controller removes its finalizer entry once it has finished cleanup work on deletion.
+  finalizers:
+    - kubernetes.io/pvc-protection
+    - example.com/my-finalizer
+
+  # ownerReferences links this Pod to a parent resource (e.g., ReplicaSet).
+  # When the owner is deleted, the garbage collector will also delete this Pod.
+  ownerReferences:
+    - apiVersion: apps/v1
+      # kind is the type of the owner resource.
+      # Common values: ReplicaSet, StatefulSet, DaemonSet, Job.
+      kind: ReplicaSet
+      # name is the name of the owning resource.
+      # Must exist in the same namespace as this Pod.
+      name: my-app-replicaset-xyz
+      # uid is the unique ID of the owning resource.
+      # Used for precise matching; prevents stale references after name reuse.
+      uid: "d9607e19-f88f-11e6-a518-42010a800195"
+      # controller indicates whether this owner is the managing controller.
+      # Only one owner should have controller: true.
+      controller: true
+      # blockOwnerDeletion prevents the owner from being deleted until this Pod is gone.
+      # Requires the owner to have a finalizer set by the garbage collector.
+      blockOwnerDeletion: true
+
+  # managedFields tracks which field manager last applied each field.
+  # Populated automatically by server-side apply; not typically set by users.
+  managedFields:
+    - manager: kubectl
+      operation: Apply
+      apiVersion: v1
+      time: "2024-01-15T10:00:00Z"
+      fieldsType: FieldsV1
+      fieldsV1:
+        f:metadata:
+          f:labels: {}
+
+# -------------------------------------------------------
+# SPEC — desired state of the Pod
+# -------------------------------------------------------
+spec:
+
+  # ---- SCHEDULING & PLACEMENT ----
+
+  # nodeName directly assigns this Pod to a specific node, bypassing the scheduler.
+  # Use only for testing or special cases; the scheduler normally handles placement.
+  nodeName: ""
+
+  # nodeSelector is a simple key/value map constraining which nodes this Pod can run on.
+  # The node must have ALL listed labels. For complex rules, use affinity instead.
+  nodeSelector:
+    kubernetes.io/os: linux
+    disktype: ssd
+
+  # affinity provides advanced scheduling rules beyond nodeSelector.
+  # Supports required (hard) and preferred (soft) rules for nodes and other pods.
+  affinity:
+
+    # nodeAffinity rules constrain which nodes the Pod can be scheduled on.
+    # Based on node labels, similar to nodeSelector but with richer expressions.
+    nodeAffinity:
+
+      # requiredDuringSchedulingIgnoredDuringExecution is a HARD constraint.
+      # The Pod will NOT be scheduled if no node satisfies this rule.
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - # key is the node label key to match against.
+                # This is the left-hand side of the expression.
+                key: kubernetes.io/e2e-az-name
+                # operator defines the relationship between key and values.
+                # In: label value must be in the values list.
+                # NotIn: label value must NOT be in the values list.
+                # Exists: label key must exist (values array ignored).
+                # DoesNotExist: label key must not exist.
+                # Gt / Lt: numeric comparison (node label value > or < values[0]).
+                operator: In
+                # operator: NotIn
+                # operator: Exists
+                # operator: DoesNotExist
+                # operator: Gt
+                # operator: Lt
+                values:
+                  - us-east-1a
+                  - us-east-1b
+            matchFields:
+              - key: metadata.name
+                operator: In
+                values:
+                  - node-1
+
+      # preferredDuringSchedulingIgnoredDuringExecution is a SOFT constraint.
+      # The scheduler tries to satisfy it but will schedule elsewhere if needed.
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          # weight is a value from 1–100 indicating preference strength.
+          # Higher weight means this preference is more important relative to others.
+          preference:
+            matchExpressions:
+              - key: another-node-label-key
+                operator: In
+                values:
+                  - another-node-label-value
+
+    # podAffinity schedules this Pod near other Pods matching the selector.
+    # Useful for co-locating components that communicate frequently.
+    podAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - my-app
+            matchLabels:
+              component: cache
+          # namespaces lists namespaces to search for matching pods.
+          # If empty, uses the namespace of this Pod.
+          namespaces:
+            - my-namespace
+          # topologyKey is the node label key defining the failure domain.
+          # Pods must be co-located within nodes sharing this label's value.
+          topologyKey: kubernetes.io/hostname
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 50
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app: my-app
+            topologyKey: topology.kubernetes.io/zone
+
+    # podAntiAffinity spreads this Pod away from Pods matching the selector.
+    # Useful for HA — ensures replicas land on different nodes or zones.
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - my-app
+          topologyKey: kubernetes.io/hostname
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app: my-app
+            topologyKey: topology.kubernetes.io/zone
+
+  # tolerations allow the Pod to be scheduled on nodes with matching taints.
+  # Without a matching toleration, a tainted node will repel the Pod.
+  tolerations:
+    - # key is the taint key to tolerate. If empty, matches all taint keys.
+      # Must match the key on the node taint exactly.
+      key: "node-role.kubernetes.io/control-plane"
+      # operator is Exists (key present) or Equal (key+value match).
+      # If operator is Exists and value is empty, matches any taint with that key.
+      operator: Exists
+      # operator: Equal
+      # value is the taint value to match. Only used when operator is Equal.
+      # Must match exactly the taint value on the node.
+      value: ""
+      # effect specifies which taint effect this toleration applies to.
+      # NoSchedule: prevents scheduling. PreferNoSchedule: soft avoid. NoExecute: evicts running pods.
+      effect: NoSchedule
+      # effect: PreferNoSchedule
+      # effect: NoExecute
+      # tolerationSeconds defines how long (in seconds) a NoExecute toleration is active.
+      # After this time, the Pod is evicted. Omit for indefinite toleration.
+      tolerationSeconds: 3600
+    - key: "special"
+      operator: Equal
+      value: "true"
+      effect: NoExecute
+
+  # topologySpreadConstraints distribute Pods evenly across topology domains.
+  # Useful to balance Pods across zones, nodes, or racks for high availability.
+  topologySpreadConstraints:
+    - # maxSkew is the maximum allowed difference in Pod count between topology domains.
+      # A value of 1 means at most 1 more Pod in one domain than another.
+      maxSkew: 1
+      # topologyKey is the node label that defines topology domains.
+      # Nodes with the same value for this label are in the same domain.
+      topologyKey: topology.kubernetes.io/zone
+      # whenUnsatisfiable defines behavior when the constraint cannot be met.
+      # DoNotSchedule: hard constraint, blocks scheduling. ScheduleAnyway: soft constraint.
+      whenUnsatisfiable: DoNotSchedule
+      # whenUnsatisfiable: ScheduleAnyway
+      # labelSelector selects the Pods to count for spreading purposes.
+      # Usually matches the same Pods as this one.
+      labelSelector:
+        matchLabels:
+          app: my-app
+      # minDomains is the minimum number of domains that must be eligible.
+      # If fewer domains are available, the constraint is treated as unsatisfiable.
+      minDomains: 2
+      # nodeAffinityPolicy controls whether nodeAffinity/nodeSelector affect domain counting.
+      # Honor: only count nodes matching affinity. Ignore: count all nodes.
+      nodeAffinityPolicy: Honor
+      # nodeTaintsPolicy controls whether node taints affect domain counting.
+      # Honor: skip tainted nodes. Ignore: count all nodes regardless of taints.
+      nodeTaintsPolicy: Honor
+
+  # ---- PRIORITY & PREEMPTION ----
+
+  # priorityClassName references a PriorityClass object giving this Pod a scheduling priority.
+  # Higher priority Pods can preempt lower priority ones when resources are scarce.
+  priorityClassName: high-priority
+
+  # priority is the integer value of the priority (set by the PriorityClass controller).
+  # You normally don't set this directly — it is populated from priorityClassName.
+  priority: 1000000
+
+  # preemptionPolicy controls whether this Pod can preempt lower priority Pods.
+  # PreemptLowerPriority (default): can preempt. Never: waits in queue without preempting.
+  preemptionPolicy: PreemptLowerPriority
+  # preemptionPolicy: Never
+
+  # ---- RUNTIME & OS ----
+
+  # runtimeClassName selects the container runtime configuration (e.g., gVisor, Kata).
+  # Must match a RuntimeClass object in the cluster. Omit for the default runtime.
+  runtimeClassName: gvisor
+
+  # os specifies the target OS for this Pod.
+  # Required when scheduling Windows Pods on a mixed-OS cluster.
+  os:
+    # name is the OS name. Must be linux or windows.
+    # Controls which node OS pool the Pod can be scheduled on.
+    name: linux
+    # name: windows
+
+  # ---- INIT CONTAINERS ----
+
+  # initContainers run sequentially before app containers start.
+  # They must complete successfully before the main containers are started. Good for setup tasks.
+  initContainers:
+    - name: init-db
+      image: busybox:1.35
+      # command overrides the image's ENTRYPOINT.
+      # Use when you need to run a different binary than the image default.
+      command: ["sh", "-c"]
+      args: ["until nc -z db-service 5432; do echo waiting for db; sleep 2; done"]
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "50m"
+        limits:
+          memory: "128Mi"
+          cpu: "100m"
+      volumeMounts:
+        - name: shared-data
+          mountPath: /shared
+
+  # ---- CONTAINERS ----
+
+  # containers is the list of application containers in this Pod.
+  # At least one container is required. They all share the Pod's network and volumes.
+  containers:
+    - # name is the unique name for this container within the Pod.
+      # Used in logs, exec commands, and resource references.
+      name: my-app
+
+      # image is the container image to run, including registry, name, and tag.
+      # Use a digest (sha256:...) instead of a tag for immutable deployments.
+      image: nginx:1.25.3
+      # image: my-registry.example.com/my-app:v1.2.3@sha256:abc123...
+
+      # imagePullPolicy controls when Kubernetes pulls the container image.
+      # Always: pull every time. IfNotPresent: pull only if not cached. Never: never pull (must exist locally).
+      imagePullPolicy: IfNotPresent
+      # imagePullPolicy: Always
+      # imagePullPolicy: Never
+
+      # command overrides the ENTRYPOINT of the container image.
+      # If not set, the image's ENTRYPOINT is used.
+      command:
+        - "/bin/sh"
+        - "-c"
+
+      # args overrides the CMD of the container image.
+      # If command is set, args are passed to that command. Otherwise appended to ENTRYPOINT.
+      args:
+        - "nginx -g 'daemon off;'"
+
+      # workingDir sets the working directory inside the container.
+      # Defaults to the image's WORKDIR if not set.
+      workingDir: /app
+
+      # ports declares the ports this container exposes.
+      # Informational only — does NOT actually expose the port. Use Services for that.
+      ports:
+        - # name gives a DNS-label name to this port for reference in Services and probes.
+          # Must be unique within the container.
+          name: http
+          # containerPort is the port number inside the container.
+          # Must be between 1 and 65535.
+          containerPort: 80
+          # protocol is the network protocol for this port.
+          # TCP is the default. UDP and SCTP are also supported.
+          protocol: TCP
+          # protocol: UDP
+          # protocol: SCTP
+          # hostPort maps the container port to a port on the host node.
+          # Avoid in production — limits Pod placement to nodes where the port is free.
+          hostPort: 8080
+          # hostIP binds hostPort to a specific IP on the host.
+          # Rarely needed; defaults to all host IPs (0.0.0.0).
+          hostIP: "0.0.0.0"
+        - name: https
+          containerPort: 443
+          protocol: TCP
+
+      # env sets individual environment variables in the container.
+      # Values can be literal strings or sourced from ConfigMaps, Secrets, or Pod fields.
+      env:
+        - # name is the environment variable name as seen inside the container.
+          # Must be a valid C identifier: letters, digits, underscores.
+          name: APP_ENV
+          # value is a literal string value for the variable.
+          # Mutually exclusive with valueFrom.
+          value: "production"
+
+        - name: DB_PASSWORD
+          # valueFrom sources the value from a ConfigMap key, Secret key, or Pod/Node field.
+          # Mutually exclusive with value.
+          valueFrom:
+            # secretKeyRef pulls the value from a Kubernetes Secret.
+            # The Secret must exist in the same namespace.
+            secretKeyRef:
+              name: my-db-secret
+              key: password
+              # optional: true means the container will start even if the Secret doesn't exist.
+              optional: false
+
+        - name: DB_HOST
+          valueFrom:
+            # configMapKeyRef pulls the value from a ConfigMap key.
+            # Useful for non-sensitive config that may vary by environment.
+            configMapKeyRef:
+              name: my-app-config
+              key: db_host
+              optional: false
+
+        - name: MY_POD_NAME
+          valueFrom:
+            # fieldRef exposes Pod metadata fields as environment variables.
+            # Common fields: metadata.name, metadata.namespace, status.podIP, spec.nodeName.
+            fieldRef:
+              # apiVersion of the schema for the fieldPath expression.
+              # Usually "v1" for core Pod fields.
+              apiVersion: v1
+              fieldPath: metadata.name
+
+        - name: MY_CPU_REQUEST
+          valueFrom:
+            # resourceFieldRef exposes container resource requests/limits as env vars.
+            # Use for apps that need to know their own resource allocation.
+            resourceFieldRef:
+              # containerName is the container whose resources to expose.
+              # If omitted, uses the current container.
+              containerName: my-app
+              resource: requests.cpu
+              # divisor scales the value. For CPU: 1=cores, 1m=millicores. For memory: 1=bytes.
+              divisor: "1m"
+
+      # envFrom loads all keys from a ConfigMap or Secret as environment variables.
+      # Faster than listing each key individually with env[].valueFrom.
+      envFrom:
+        - # configMapRef loads all keys from a ConfigMap as env vars.
+          # Key names become variable names; values become variable values.
+          configMapRef:
+            name: my-app-config
+            optional: false
+          # prefix prepends a string to all variable names loaded from this source.
+          # Useful to avoid naming conflicts between multiple sources.
+          prefix: "APP_"
+        - secretRef:
+            # secretRef loads all keys from a Secret as environment variables.
+            # Use carefully — all keys become visible as env vars.
+            name: my-app-secrets
+            optional: false
+
+      # resources defines CPU and memory requests and limits for this container.
+      # Requests are used for scheduling; limits are enforced at runtime.
+      resources:
+        # requests are the minimum resources the container needs.
+        # The scheduler ensures the node has at least this much available.
+        requests:
+          # cpu is specified in cores (e.g., "1") or millicores (e.g., "500m").
+          # 500m = 0.5 CPU cores. This is the minimum CPU guaranteed.
+          cpu: "250m"
+          # memory is specified in bytes, kibibytes (Ki), mebibytes (Mi), gibibytes (Gi).
+          # This is the minimum memory guaranteed to the container.
+          memory: "256Mi"
+          # hugepages-2Mi and hugepages-1Gi can request huge memory pages.
+          # Requires the node to have hugepages configured.
+          hugepages-2Mi: "128Mi"
+        # limits cap the maximum resources the container can consume.
+        # Exceeding CPU limit causes throttling; exceeding memory limit causes OOMKill.
+        limits:
+          cpu: "1000m"
+          memory: "512Mi"
+          hugepages-2Mi: "128Mi"
+          # ephemeral-storage limits the amount of local ephemeral storage used.
+          # Includes emptyDir, container logs, and writeable container layer.
+          ephemeral-storage: "1Gi"
+
+      # volumeMounts specify paths inside the container where volumes are mounted.
+      # The volume must be declared in spec.volumes.
+      volumeMounts:
+        - # name must match a volume name in spec.volumes.
+          # This links the mount point to the actual volume definition.
+          name: config-volume
+          # mountPath is the absolute path inside the container where the volume is mounted.
+          # If the path exists, it is replaced by the volume content.
+          mountPath: /etc/config
+          # subPath mounts only a specific file or directory from the volume.
+          # Allows multiple containers to share one volume with different subdirectories.
+          subPath: app.properties
+          # readOnly mounts the volume in read-only mode inside the container.
+          # Default is false (read-write).
+          readOnly: false
+          # mountPropagation controls how mounts are propagated between host and container.
+          # None (default): no propagation. HostToContainer: host mounts visible in container. Bidirectional: two-way.
+          mountPropagation: None
+          # mountPropagation: HostToContainer
+          # mountPropagation: Bidirectional
+        - name: data-volume
+          mountPath: /data
+          readOnly: false
+        - name: secret-volume
+          mountPath: /etc/secrets
+          readOnly: true
+          # subPathExpr is like subPath but allows environment variable expansion.
+          # Use $(VAR_NAME) syntax to reference env vars set in the container.
+          subPathExpr: "$(MY_POD_NAME)"
+
+      # volumeDevices maps block volumes directly to device paths (raw block storage).
+      # Only for volumes with volumeMode: Block. Bypasses filesystem layer.
+      volumeDevices:
+        - name: my-block-volume
+          # devicePath is the path inside the container where the block device appears.
+          # Apps access it as a raw block device, not a mounted filesystem.
+          devicePath: /dev/xvda
+
+      # livenessProbe checks if the container is alive and healthy.
+      # If it fails consecutively (failureThreshold times), the container is restarted.
+      livenessProbe:
+        # httpGet performs an HTTP GET request to check liveness.
+        # A 2xx or 3xx response is considered success.
+        httpGet:
+          # path is the URL path for the HTTP GET request.
+          # Should be a lightweight health endpoint that checks core functionality.
+          path: /healthz
+          # port can be a number or a named port from the container's ports list.
+          # Must be a port the container is listening on.
+          port: 8080
+          # port: http  # can use named port
+          # host overrides the hostname for the HTTP request.
+          # Defaults to the Pod IP. Rarely needed to override.
+          host: ""
+          # scheme is HTTP or HTTPS for the health check connection.
+          # Use HTTPS if the container serves TLS. Does not verify certificate by default.
+          scheme: HTTP
+          # scheme: HTTPS
+          # httpHeaders adds custom HTTP headers to the probe request.
+          # Useful for setting Host header or authentication tokens.
+          httpHeaders:
+            - name: X-Custom-Header
+              value: health-check
+        # --- Alternative probe types (use ONE of: httpGet, exec, tcpSocket, grpc) ---
+        # exec:
+        #   command: ["cat", "/tmp/healthy"]
+        #   # Runs a command inside the container. Exit code 0 = success; non-zero = failure.
+        # tcpSocket:
+        #   port: 8080
+        #   host: ""
+        #   # Opens a TCP connection to the port. Success means the container is listening.
+        # grpc:
+        #   port: 8080
+        #   service: "liveness"
+        #   # Checks a gRPC health service. Requires the container to implement gRPC health protocol.
+
+        # initialDelaySeconds is how long to wait after container start before probing.
+        # Set high enough for the app to fully initialize before the first check.
+        initialDelaySeconds: 15
+        # periodSeconds is how often (in seconds) the probe is performed.
+        # Lower = faster detection, higher = less overhead.
+        periodSeconds: 20
+        # timeoutSeconds is how long the probe waits for a response before timing out.
+        # If the container takes longer than this, the probe counts as a failure.
+        timeoutSeconds: 5
+        # successThreshold is the minimum consecutive successes to consider the probe successful.
+        # For liveness/startup this must be 1.
+        successThreshold: 1
+        # failureThreshold is the number of consecutive failures before the action is taken.
+        # For liveness: container is restarted. For readiness: removed from Service endpoints.
+        failureThreshold: 3
+        # terminationGracePeriodSeconds overrides the Pod-level value for this probe only.
+        # Gives the container extra time to clean up after a liveness probe failure triggers restart.
+        terminationGracePeriodSeconds: 30
+
+      # readinessProbe determines when the container is ready to receive traffic.
+      # Failed readiness removes the Pod from Service load balancer endpoints.
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8080
+          scheme: HTTP
+        # exec:
+        #   command: ["sh", "-c", "test -f /tmp/ready"]
+        # tcpSocket:
+        #   port: 8080
+        # grpc:
+        #   port: 8080
+        #   service: "readiness"
+        initialDelaySeconds: 5
+        periodSeconds: 10
+        timeoutSeconds: 3
+        successThreshold: 1
+        failureThreshold: 3
+
+      # startupProbe detects if the container has finished starting up.
+      # During startup, liveness and readiness probes are disabled until this succeeds.
+      startupProbe:
+        httpGet:
+          path: /startup
+          port: 8080
+        # exec:
+        #   command: ["sh", "-c", "test -f /app/started"]
+        # tcpSocket:
+        #   port: 8080
+        # grpc:
+        #   port: 8080
+        #   service: "startup"
+        initialDelaySeconds: 0
+        periodSeconds: 10
+        timeoutSeconds: 5
+        successThreshold: 1
+        # failureThreshold * periodSeconds = max startup time allowed before giving up.
+        # Set this generously for slow-starting apps (e.g., 30 * 10 = 300 seconds).
+        failureThreshold: 30
+
+      # lifecycle defines handlers called at container lifecycle events.
+      # postStart fires after the container starts; preStop fires before it stops.
+      lifecycle:
+        # postStart is called immediately after the container starts.
+        # Runs concurrently with the container entrypoint. Not guaranteed to run before ENTRYPOINT.
+        postStart:
+          exec:
+            command: ["/bin/sh", "-c", "echo container started > /proc/1/fd/1"]
+          # httpGet:
+          #   path: /post-start
+          #   port: 8080
+          #   host: ""
+          #   scheme: HTTP
+          # tcpSocket:
+          #   port: 8080
+          #   host: ""
+        # preStop is called before the container receives SIGTERM.
+        # Use for graceful shutdown logic such as draining connections.
+        preStop:
+          exec:
+            command: ["/bin/sh", "-c", "nginx -s quit; while killall -0 nginx; do sleep 1; done"]
+          # httpGet:
+          #   path: /shutdown
+          #   port: 8080
+          #   scheme: HTTP
+          # sleep:
+          #   seconds: 10
+          #   # Pauses the container shutdown for the given number of seconds.
+          #   # Simple way to allow graceful connection draining.
+
+      # terminationMessagePath is the file path where the container writes its termination message.
+      # The message is stored in the Pod status and visible via kubectl describe pod.
+      terminationMessagePath: /dev/termination-log
+
+      # terminationMessagePolicy controls how the termination message is populated.
+      # File: read from terminationMessagePath. FallbackToLogsOnError: use logs if file is empty on error.
+      terminationMessagePolicy: File
+      # terminationMessagePolicy: FallbackToLogsOnError
+
+      # securityContext defines security settings for this specific container.
+      # Overrides or extends the Pod-level securityContext.
+      securityContext:
+        # runAsUser sets the UID used to run all processes in the container.
+        # Overrides the USER instruction in the Dockerfile.
+        runAsUser: 1000
+        # runAsGroup sets the GID for the container's primary process.
+        # Affects file creation ownership inside the container.
+        runAsGroup: 3000
+        # runAsNonRoot ensures the container does not run as root (UID 0).
+        # The kubelet will error if the image runs as root and this is true.
+        runAsNonRoot: true
+        # readOnlyRootFilesystem mounts the container's root filesystem as read-only.
+        # Hardens the container against filesystem-based attacks.
+        readOnlyRootFilesystem: true
+        # allowPrivilegeEscalation controls whether the process can gain more privileges than its parent.
+        # Set to false to prevent setuid binaries from elevating privileges.
+        allowPrivilegeEscalation: false
+        # privileged gives the container root-level access to the host.
+        # Equivalent to running Docker with --privileged. Avoid in production.
+        privileged: false
+        # procMount controls the type of /proc mount in the container.
+        # Default: masks certain sensitive /proc paths. Unmasked: exposes full /proc.
+        procMount: Default
+        # procMount: Unmasked
+        # capabilities add or drop Linux capabilities from the container.
+        # Start from scratch by dropping all and adding only what's needed.
+        capabilities:
+          drop:
+            - ALL
+          add:
+            - NET_BIND_SERVICE
+        # seccompProfile controls the seccomp profile applied to the container.
+        # RuntimeDefault uses the container runtime's default. Localhost uses a custom local file.
+        seccompProfile:
+          type: RuntimeDefault
+          # type: Localhost
+          # localhostProfile: profiles/audit.json
+          # type: Unconfined  # disables seccomp filtering entirely
+        # seLinuxOptions sets SELinux context on the container.
+        # Requires SELinux to be enabled and configured on the node.
+        seLinuxOptions:
+          level: "s0:c123,c456"
+          role: ""
+          type: ""
+          user: ""
+        # windowsOptions are Windows-specific security settings.
+        # Only applicable when scheduling on Windows nodes.
+        windowsOptions:
+          gmsaCredentialSpecName: ""
+          gmsaCredentialSpec: ""
+          runAsUserName: ""
+          hostProcess: false
+
+      # stdin allocates a stdin stream for the container.
+      # Required if you want to interact with the container via kubectl attach.
+      stdin: false
+
+      # stdinOnce closes the stdin stream after the first attach session ends.
+      # Prevents multiple concurrent stdin sessions.
+      stdinOnce: false
+
+      # tty allocates a TTY for the container, enabling interactive terminal sessions.
+      # Usually used together with stdin: true.
+      tty: false
+
+  # ---- EPHEMERAL CONTAINERS ----
+
+  # ephemeralContainers are temporary containers added to a running Pod for debugging.
+  # They cannot be removed once added and have limited configurability vs regular containers.
+  ephemeralContainers:
+    - name: debugger
+      image: busybox:1.35
+      # command overrides the container image entrypoint for the debug session.
+      # Useful for launching a shell in the ephemeral container.
+      command: ["sh"]
+      stdin: true
+      tty: true
+      # targetContainerName specifies which container's process namespace to share.
+      # Allows the ephemeral container to inspect the target container's processes.
+      targetContainerName: my-app
+
+  # ---- DNS CONFIGURATION ----
+
+  # dnsPolicy controls DNS resolution for Pods.
+  # ClusterFirst: use cluster DNS, fallback to node. Default: use node DNS. None: use dnsConfig only.
+  dnsPolicy: ClusterFirst
+  # dnsPolicy: ClusterFirstWithHostNet
+  # dnsPolicy: Default
+  # dnsPolicy: None
+
+  # dnsConfig fine-tunes DNS settings, especially when dnsPolicy is None.
+  # Can add search domains, nameservers, and resolver options.
+  dnsConfig:
+    # nameservers is a list of DNS server IP addresses.
+    # Overrides or supplements the default DNS servers.
+    nameservers:
+      - 1.1.1.1
+      - 8.8.8.8
+    # searches is a list of DNS search domains appended to short hostnames.
+    # Kubernetes adds cluster.local and namespace-scoped domains by default.
+    searches:
+      - my-namespace.svc.cluster.local
+      - svc.cluster.local
+      - cluster.local
+    # options is a list of DNS resolver options such as ndots and timeout.
+    # These are passed directly to the resolv.conf options field.
+    options:
+      - name: ndots
+        value: "5"
+      - name: timeout
+        value: "2"
+
+  # ---- NETWORKING ----
+
+  # hostNetwork uses the host node's network namespace directly.
+  # The Pod sees all host network interfaces. Required for some CNI plugins and host-level monitoring.
+  hostNetwork: false
+
+  # hostPID uses the host's PID namespace, making all host processes visible inside the container.
+  # Required for tools like strace that need to observe host processes.
+  hostPID: false
+
+  # hostIPC uses the host's IPC namespace for shared memory between Pod and host.
+  # Required for high-performance shared-memory communication with host processes.
+  hostIPC: false
+
+  # hostname sets the hostname of the Pod.
+  # Defaults to the Pod name if not set.
+  hostname: my-app-pod
+
+  # subdomain sets the DNS subdomain for the Pod.
+  # When set, the Pod's FQDN becomes: hostname.subdomain.namespace.svc.cluster.local.
+  subdomain: my-app
+
+  # hostAliases adds entries to the Pod's /etc/hosts file.
+  # Useful for overriding DNS resolution for specific hostnames inside the Pod.
+  hostAliases:
+    - ip: "127.0.0.1"
+      hostnames:
+        - "foo.local"
+        - "bar.local"
+    - ip: "192.168.1.100"
+      hostnames:
+        - "legacy-db.internal"
+
+  # setHostnameAsFQDN sets the Pod's FQDN as its hostname if true.
+  # Required for some applications that need the full qualified domain name as hostname.
+  setHostnameAsFQDN: false
+
+  # shareProcessNamespace allows all containers in the Pod to share one PID namespace.
+  # Containers can see and signal each other's processes. Useful for sidecar patterns.
+  shareProcessNamespace: false
+
+  # ---- SERVICE ACCOUNT & RBAC ----
+
+  # serviceAccountName is the name of the ServiceAccount to use for API access.
+  # The ServiceAccount's token is mounted at /var/run/secrets/kubernetes.io/serviceaccount/.
+  serviceAccountName: my-service-account
+
+  # automountServiceAccountToken controls whether the SA token is auto-mounted.
+  # Set to false for Pods that don't need Kubernetes API access (reduces attack surface).
+  automountServiceAccountToken: true
+
+  # ---- IMAGE PULL ----
+
+  # imagePullSecrets references Secrets containing registry credentials.
+  # Required to pull images from private container registries.
+  imagePullSecrets:
+    - name: my-registry-secret
+    - name: another-registry-secret
+
+  # ---- SECURITY CONTEXT (POD LEVEL) ----
+
+  # securityContext applies security settings to all containers in the Pod.
+  # Container-level securityContext can override these values.
+  securityContext:
+    # runAsUser sets the UID for all containers unless overridden per-container.
+    # Helps ensure containers don't run as root.
+    runAsUser: 1000
+    # runAsGroup sets the GID for all containers unless overridden per-container.
+    # Also controls the group ownership of volumes mounted into the Pod.
+    runAsGroup: 3000
+    # runAsNonRoot enforces that containers do not run as UID 0 (root).
+    # The kubelet rejects the container if the image's USER is root.
+    runAsNonRoot: true
+    # fsGroup sets the GID for volume ownership and supplemental group.
+    # Files created in volumes will be owned by this GID.
+    fsGroup: 2000
+    # fsGroupChangePolicy controls when Kubernetes changes volume ownership.
+    # OnRootMismatch: only change if root dir GID doesn't match. Always: always change.
+    fsGroupChangePolicy: OnRootMismatch
+    # fsGroupChangePolicy: Always
+    # supplementalGroups adds extra GIDs to the container process's group list.
+    # Useful for accessing shared volumes owned by specific groups.
+    supplementalGroups:
+      - 4000
+      - 5000
+    # sysctls sets kernel parameters (sysctls) for the Pod's network namespace.
+    # Only namespaced sysctls are allowed (net.*, kernel.shm*, etc.).
+    sysctls:
+      - name: net.core.somaxconn
+        value: "1024"
+      - name: net.ipv4.tcp_tw_reuse
+        value: "1"
+    # seccompProfile sets the seccomp profile for all containers.
+    # Can be overridden per container.
+    seccompProfile:
+      type: RuntimeDefault
+      # type: Localhost
+      # localhostProfile: profiles/audit.json
+    # seLinuxOptions sets the SELinux context for all containers in the Pod.
+    # Requires SELinux to be enabled on the node.
+    seLinuxOptions:
+      level: "s0:c123,c456"
+      role: ""
+      type: ""
+      user: ""
+    # windowsOptions applies Windows-specific security settings Pod-wide.
+    # Only relevant for Windows Pods.
+    windowsOptions:
+      gmsaCredentialSpecName: ""
+      gmsaCredentialSpec: ""
+      runAsUserName: ""
+      hostProcess: false
+
+  # ---- TERMINATION ----
+
+  # terminationGracePeriodSeconds is how long Kubernetes waits after sending SIGTERM before SIGKILL.
+  # Give your app enough time to drain connections and finish in-flight work.
+  terminationGracePeriodSeconds: 30
+
+  # activeDeadlineSeconds sets a time limit (in seconds) for the entire Pod to run.
+  # After this time, the Pod is terminated. Useful for Jobs, not long-running services.
+  activeDeadlineSeconds: 3600
+
+  # restartPolicy controls when containers are restarted after exit.
+  # Always: always restart (default for Deployments). OnFailure: restart on non-zero exit. Never: never restart.
+  restartPolicy: Always
+  # restartPolicy: OnFailure
+  # restartPolicy: Never
+
+  # ---- VOLUMES ----
+
+  # volumes defines storage volumes available to containers in this Pod.
+  # Each volume is referenced by name in container volumeMounts.
+  volumes:
+
+    - name: config-volume
+      # configMap mounts a ConfigMap's data as files inside the container.
+      # Each key in the ConfigMap becomes a file; the value is the file content.
+      configMap:
+        name: my-app-config
+        # defaultMode sets the file permission bits for mounted files (octal, default 0644).
+        # Use 0755 for scripts, 0400 for sensitive files.
+        defaultMode: 0644
+        # optional allows the Pod to start even if the ConfigMap doesn't exist.
+        optional: false
+        items:
+          - # key is the ConfigMap key to mount as a specific file.
+            # If items is set, only listed keys are mounted.
+            key: app.properties
+            # path is the filename to use inside the volume (relative to mountPath).
+            # Can include subdirectories.
+            path: app.properties
+            # mode overrides the file permission for this specific item.
+            mode: 0644
+
+    - name: secret-volume
+      # secret mounts a Secret's data as files inside the container.
+      # Secret values are base64-decoded before being written to files.
+      secret:
+        secretName: my-app-secrets
+        defaultMode: 0400
+        optional: false
+        items:
+          - key: tls.crt
+            path: tls.crt
+          - key: tls.key
+            path: tls.key
+            mode: 0400
+
+    - name: data-volume
+      # persistentVolumeClaim mounts a PersistentVolumeClaim into the Pod.
+      # The PVC must exist and be bound before the Pod can start.
+      persistentVolumeClaim:
+        claimName: my-pvc
+        # readOnly mounts the PVC in read-only mode.
+        # Default is false. Set true to prevent accidental writes.
+        readOnly: false
+
+    - name: empty-scratch
+      # emptyDir creates a temporary directory shared between all containers in the Pod.
+      # Deleted when the Pod is removed from the node.
+      emptyDir:
+        # medium controls the storage medium. "" = default disk. Memory = tmpfs (RAM-backed).
+        # Memory is faster but counts against the container's memory limit.
+        medium: ""
+        # medium: Memory
+        # sizeLimit caps the size of the emptyDir volume.
+        # For tmpfs (Memory), this is also the size of the RAM disk.
+        sizeLimit: "500Mi"
+
+    - name: host-path-volume
+      # hostPath mounts a path from the host node's filesystem into the Pod.
+      # Use with caution — creates tight coupling between Pod and node.
+      hostPath:
+        # path is the absolute path on the host node to mount.
+        # The directory must exist on the node (or be created by Kubernetes if type allows).
+        path: /var/log/myapp
+        # type controls how the hostPath is validated.
+        # "" (default): no checks. DirectoryOrCreate: create if missing. Directory: must exist.
+        # FileOrCreate, File, Socket, CharDevice, BlockDevice also available.
+        type: DirectoryOrCreate
+        # type: Directory
+        # type: File
+        # type: FileOrCreate
+        # type: Socket
+        # type: CharDevice
+        # type: BlockDevice
+
+    - name: projected-volume
+      # projected combines multiple volume sources (ConfigMap, Secret, ServiceAccountToken, DownwardAPI) into one.
+      # Useful for mounting auth tokens alongside config in a single directory.
+      projected:
+        defaultMode: 0644
+        sources:
+          - configMap:
+              name: my-app-config
+              items:
+                - key: app.conf
+                  path: app.conf
+          - secret:
+              name: my-app-secrets
+              items:
+                - key: api-key
+                  path: api-key
+          - serviceAccountToken:
+              # audience is the intended audience of the token (for OIDC validation).
+              # Defaults to the API server's audience.
+              audience: api
+              # expirationSeconds is the token validity duration in seconds.
+              # After expiry, kubelet auto-rotates the token.
+              expirationSeconds: 3600
+              path: token
+          - downwardAPI:
+              items:
+                - path: labels
+                  fieldRef:
+                    fieldPath: metadata.labels
+
+    - name: downward-api-volume
+      # downwardAPI exposes Pod and container metadata as files inside the container.
+      # Useful for apps that need to know their own name, namespace, or resource limits.
+      downwardAPI:
+        defaultMode: 0644
+        items:
+          - path: "labels"
+            fieldRef:
+              fieldPath: metadata.labels
+          - path: "annotations"
+            fieldRef:
+              fieldPath: metadata.annotations
+          - path: "cpu_limit"
+            resourceFieldRef:
+              containerName: my-app
+              resource: limits.cpu
+              divisor: "1m"
+          - path: "mem_limit"
+            resourceFieldRef:
+              containerName: my-app
+              resource: limits.memory
+              divisor: "1Mi"
+
+    - name: nfs-volume
+      # nfs mounts a Network File System share into the Pod.
+      # Requires an NFS server accessible from all nodes where this Pod may run.
+      nfs:
+        # server is the hostname or IP of the NFS server.
+        # Must be reachable from every node in the cluster.
+        server: nfs-server.example.com
+        # path is the exported NFS path on the server.
+        # Must be an exported directory on the NFS server.
+        path: /exports/myapp
+        # readOnly mounts the NFS share read-only.
+        readOnly: false
+
+    - name: my-block-volume
+      # persistentVolumeClaim can also be used for raw block volumes.
+      # Set volumeMode: Block in the PVC to get a raw block device.
+      persistentVolumeClaim:
+        claimName: my-block-pvc
+        readOnly: false
+
+    - name: git-repo-volume
+      # gitRepo is deprecated — prefer using an initContainer to clone git repos.
+      # Mounts a git repository into the Pod at startup.
+      gitRepo:
+        repository: "https://github.com/example/repo.git"
+        revision: "abc1234"
+        directory: "."
+
+    - name: csi-volume
+      # csi mounts a volume from a Container Storage Interface (CSI) driver.
+      # Used for cloud-provider or third-party storage solutions (e.g., secrets-store-csi-driver).
+      csi:
+        # driver is the name of the CSI driver to use.
+        # Must be registered in the cluster as a CSIDriver object.
+        driver: secrets-store.csi.k8s.io
+        # readOnly controls whether the mount is read-only.
+        readOnly: true
+        # fsType is the filesystem type to mount (e.g., ext4, xfs).
+        # Leave blank for block devices or when the driver handles formatting.
+        fsType: ""
+        # volumeAttributes are driver-specific parameters passed to the CSI plugin.
+        # Keys and values are defined by the CSI driver's documentation.
+        volumeAttributes:
+          secretProviderClass: "my-secret-provider"
+        # nodePublishSecretRef references a Secret with credentials for the CSI driver.
+        nodePublishSecretRef:
+          name: csi-secrets
+
+  # ---- OVERHEAD ----
+
+  # overhead accounts for resource overhead of the Pod sandbox (e.g., Kata containers).
+  # Set automatically by the RuntimeClass admission controller. Do not set manually.
+  overhead:
+    cpu: "250m"
+    memory: "128Mi"
+
+  # ---- READINESS GATES ----
+
+  # readinessGates adds extra conditions that must be true for the Pod to be Ready.
+  # Custom controllers can set these conditions to hold traffic until extra checks pass.
+  readinessGates:
+    - # conditionType is the name of the custom condition to check.
+      # Must be set to True by an external controller for the Pod to be considered Ready.
+      conditionType: "www.example.com/feature-1"
+
+  # ---- PREEMPTION & DISRUPTION ----
+
+  # enableServiceLinks controls injection of Service-related env vars into the Pod.
+  # When true, Service ClusterIP and port are injected as {SVC_NAME}_SERVICE_HOST etc.
+  enableServiceLinks: true
+
+  # preemptionPolicy determines whether this Pod can preempt lower-priority Pods.
+  # PreemptLowerPriority: may preempt. Never: waits in queue without preempting.
+  preemptionPolicy: PreemptLowerPriority
+
+# -------------------------------------------------------
+# STATUS — set by Kubernetes control plane, not by the user
+# -------------------------------------------------------
+status:
+
+  # phase is the high-level summary of where the Pod is in its lifecycle.
+  # Pending: not yet running. Running: at least one container is running. Succeeded: all exited 0.
+  # Failed: at least one container exited non-zero. Unknown: state cannot be determined.
+  phase: Running
+  # phase: Pending
+  # phase: Succeeded
+  # phase: Failed
+  # phase: Unknown
+
+  # conditions is an array of current observed conditions for the Pod.
+  # Used by the scheduler, controllers, and readinessGates.
+  conditions:
+    - # type is the condition identifier.
+      # Initialized: all init containers completed. Ready: pod is ready to serve traffic. ContainersReady: all containers ready.
+      type: Ready
+      # status is True, False, or Unknown.
+      status: "True"
+      # lastProbeTime is the last time the condition was probed.
+      lastProbeTime: null
+      # lastTransitionTime is when the condition last changed state.
+      lastTransitionTime: "2024-01-15T10:00:00Z"
+      # reason is a camelCase reason for the condition's last transition.
+      reason: ""
+      # message is a human-readable message about the condition.
+      message: ""
+    - type: Initialized
+      status: "True"
+      lastTransitionTime: "2024-01-15T09:59:00Z"
+    - type: ContainersReady
+      status: "True"
+      lastTransitionTime: "2024-01-15T10:00:00Z"
+    - type: PodScheduled
+      status: "True"
+      lastTransitionTime: "2024-01-15T09:58:00Z"
+
+  # message is a human-readable message indicating details about why the Pod is in this phase.
+  message: ""
+
+  # reason is a brief CamelCase message indicating details about why the Pod is in this state.
+  reason: ""
+
+  # nominatedNodeName is set if the Pod has been nominated to run on a specific node but hasn't been bound yet.
+  # This happens during preemption: the Pod is nominated while victim Pods are being terminated.
+  nominatedNodeName: ""
+
+  # hostIP is the IP address of the host (node) running this Pod.
+  # Useful for host-level networking or monitoring.
+  hostIP: "10.0.0.5"
+
+  # podIP is the IP address allocated to this Pod within the cluster network.
+  # Other Pods can reach this Pod at this IP directly.
+  podIP: "192.168.1.10"
+
+  # podIPs is the list of IPs allocated (for dual-stack IPv4/IPv6 clusters).
+  # The first entry matches podIP.
+  podIPs:
+    - ip: "192.168.1.10"
+    - ip: "fd00::10"
+
+  # startTime is the timestamp when the Pod was acknowledged by the kubelet.
+  startTime: "2024-01-15T09:58:00Z"
+
+  # containerStatuses is the status of each container in the Pod.
+  # Reflects the current runtime state: running, waiting, or terminated.
+  containerStatuses:
+    - # name matches the container name in spec.containers.
+      name: my-app
+      # state is the current state of the container.
+      state:
+        # running indicates the container is currently executing.
+        running:
+          startedAt: "2024-01-15T10:00:00Z"
+        # waiting indicates the container is not yet running.
+        # waiting:
+        #   reason: ContainerCreating
+        #   message: ""
+        # terminated indicates the container has stopped.
+        # terminated:
+        #   exitCode: 0
+        #   signal: 0
+        #   reason: Completed
+        #   message: ""
+        #   startedAt: "2024-01-15T10:00:00Z"
+        #   finishedAt: "2024-01-15T11:00:00Z"
+        #   containerID: "containerd://abc123"
+      # lastState records the previous state of the container.
+      # Useful for debugging crash loops.
+      lastState: {}
+      # ready reflects whether the container has passed its readiness probe.
+      ready: true
+      # restartCount is how many times this container has been restarted.
+      restartCount: 0
+      # image is the image the container is currently running.
+      image: nginx:1.25.3
+      # imageID is the image digest pulled from the registry.
+      imageID: "docker-pullable://nginx@sha256:abc123..."
+      # containerID is the runtime container ID (e.g., containerd://...).
+      containerID: "containerd://def456..."
+      # started indicates the container has passed its startupProbe.
+      started: true
+
+  # initContainerStatuses is the status of each init container.
+  # Same structure as containerStatuses.
+  initContainerStatuses:
+    - name: init-db
+      state:
+        terminated:
+          exitCode: 0
+          reason: Completed
+          startedAt: "2024-01-15T09:59:00Z"
+          finishedAt: "2024-01-15T09:59:30Z"
+          containerID: "containerd://init123..."
+      ready: true
+      restartCount: 0
+      image: busybox:1.35
+      imageID: "docker-pullable://busybox@sha256:xyz..."
+      containerID: "containerd://init123..."
+      started: false
+
+  # ephemeralContainerStatuses tracks the status of any ephemeral containers.
+  # Same structure as containerStatuses.
+  ephemeralContainerStatuses: []
+
+  # qosClass is the Quality of Service class assigned to the Pod.
+  # Guaranteed: requests == limits for all containers. Burstable: partial. BestEffort: no requests/limits.
+  qosClass: Burstable
+  # qosClass: Guaranteed
+  # qosClass: BestEffort
+```
+
+
+---
+
+## 2. Deployment
+
+A Deployment manages a ReplicaSet, which in turn manages a set of identical Pods. It provides declarative updates, rolling upgrades, rollback, and scaling for stateless applications.
+Deployments are the standard way to run stateless workloads in Kubernetes — they guarantee the desired number of Pods are always running.
+
+```yaml
+# ============================================================
+# DEPLOYMENT — Complete Field Reference
+# ============================================================
+
+apiVersion: apps/v1
+
+# kind declares this as a Deployment resource.
+# Deployments manage ReplicaSets which manage Pods.
+kind: Deployment
+
+# -------------------------------------------------------
+# METADATA
+# -------------------------------------------------------
+metadata:
+  name: my-app-deployment
+  namespace: my-namespace
+  labels:
+    app: my-app
+    version: "1.0.0"
+    environment: production
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    kubernetes.io/change-cause: "Initial deployment of v1.0.0"
+  finalizers: []
+  ownerReferences: []
+
+# -------------------------------------------------------
+# SPEC — desired state of the Deployment
+# -------------------------------------------------------
+spec:
+
+  # replicas is the desired number of Pod replicas.
+  # Defaults to 1 if not specified. Can be scaled manually or by an HPA.
+  replicas: 3
+
+  # selector determines which Pods are managed by this Deployment.
+  # Must match the labels in spec.template.metadata.labels — immutable after creation.
+  selector:
+    # matchLabels is a simple equality-based label selector.
+    # All listed labels must be present and equal on the Pod.
+    matchLabels:
+      app: my-app
+      version: "1.0.0"
+    # matchExpressions is a set-based selector supporting In, NotIn, Exists, DoesNotExist.
+    # More expressive than matchLabels; combined with matchLabels using AND.
+    matchExpressions:
+      - key: environment
+        operator: In
+        values:
+          - production
+          - staging
+      - key: deprecated
+        operator: DoesNotExist
+
+  # ---- ROLLING UPDATE STRATEGY ----
+
+  # strategy controls how Pods are replaced during updates.
+  strategy:
+    # type determines the update strategy.
+    # RollingUpdate: gradually replaces old Pods with new ones. Recreate: kills all old Pods first.
+    type: RollingUpdate
+    # type: Recreate  # causes downtime; all old pods deleted before new ones start
+
+    # rollingUpdate fine-tunes the rolling update behavior.
+    # Only valid when type is RollingUpdate.
+    rollingUpdate:
+      # maxUnavailable is the max number of Pods that can be unavailable during the update.
+      # Can be an absolute number (e.g., 1) or a percentage (e.g., 25%).
+      maxUnavailable: 1
+      # maxUnavailable: "25%"
+      # maxSurge is the max number of Pods that can be created above the desired count.
+      # Can be an absolute number or percentage. 0 is not allowed if maxUnavailable is also 0.
+      maxSurge: 1
+      # maxSurge: "25%"
+
+  # minReadySeconds is the number of seconds a new Pod must be Ready before it's considered available.
+  # Helps ensure stability before proceeding with a rolling update.
+  minReadySeconds: 10
+
+  # revisionHistoryLimit is the number of old ReplicaSets to retain for rollback.
+  # Set to 0 to disable rollback history. Default is 10.
+  revisionHistoryLimit: 10
+
+  # progressDeadlineSeconds is the max time the Deployment has to make progress during an update.
+  # If exceeded, the Deployment is marked as failed. Default is 600 seconds.
+  progressDeadlineSeconds: 600
+
+  # paused suspends the Deployment's reconciliation loop.
+  # Useful for making multiple changes at once before triggering a rollout.
+  paused: false
+
+  # ---- POD TEMPLATE ----
+
+  # template is the Pod template used to create new Pods.
+  # The template spec is identical to a Pod spec — all Pod fields apply here.
+  template:
+    metadata:
+      # labels on the Pod template MUST match spec.selector.matchLabels.
+      # The Deployment controller will reject templates that don't match the selector.
+      labels:
+        app: my-app
+        version: "1.0.0"
+        environment: production
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      # All fields from Pod spec apply here. See Pod section for full documentation.
+      # The following is a representative subset for a production Deployment.
+
+      serviceAccountName: my-service-account
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+
+      imagePullSecrets:
+        - name: my-registry-secret
+
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 3000
+        runAsNonRoot: true
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: my-app
+                topologyKey: kubernetes.io/hostname
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: my-app
+
+      initContainers:
+        - name: migrate-db
+          image: my-app:1.0.0
+          command: ["./migrate"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+          envFrom:
+            - secretRef:
+                name: my-app-secrets
+
+      containers:
+        - name: my-app
+          image: my-app:1.0.0
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+
+          env:
+            - name: APP_ENV
+              value: "production"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: my-app-secrets
+                  key: db_password
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          envFrom:
+            - configMapRef:
+                name: my-app-config
+
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+
+          startupProbe:
+            httpGet:
+              path: /startup
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 10
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/config
+              readOnly: true
+            - name: tmp-dir
+              mountPath: /tmp
+            - name: data-volume
+              mountPath: /data
+
+        # Sidecar container example (e.g., log shipper)
+        - name: log-shipper
+          image: fluent-bit:2.1
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: log-volume
+              mountPath: /var/log/app
+              readOnly: true
+
+      volumes:
+        - name: config-volume
+          configMap:
+            name: my-app-config
+            defaultMode: 0644
+        - name: tmp-dir
+          emptyDir:
+            medium: ""
+            sizeLimit: "100Mi"
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: my-app-pvc
+        - name: log-volume
+          emptyDir:
+            sizeLimit: "200Mi"
+
+      nodeSelector:
+        kubernetes.io/os: linux
+
+      tolerations:
+        - key: "dedicated"
+          operator: Equal
+          value: "my-app"
+          effect: NoSchedule
+
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+
+# -------------------------------------------------------
+# STATUS — set by Kubernetes control plane, not by the user
+# -------------------------------------------------------
+status:
+
+  # observedGeneration is the most recent generation that the controller has observed.
+  # When it equals metadata.generation, the controller has processed the latest spec.
+  observedGeneration: 3
+
+  # replicas is the total number of non-terminated Pods targeted by this Deployment.
+  replicas: 3
+
+  # updatedReplicas is the number of Pods that have been updated to the latest template spec.
+  # When this equals replicas, the rollout is complete.
+  updatedReplicas: 3
+
+  # readyReplicas is the number of Pods targeted by this Deployment that have a Ready condition.
+  readyReplicas: 3
+
+  # availableReplicas is the number of Pods that have been available for at least minReadySeconds.
+  availableReplicas: 3
+
+  # unavailableReplicas is the number of Pods that should be running but are not (yet).
+  unavailableReplicas: 0
+
+  # collisionCount is the count of hash collisions for the Deployment.
+  # Incremented when a ReplicaSet name hash collides with an existing ReplicaSet.
+  collisionCount: 0
+
+  # conditions reflect the current state of the Deployment.
+  conditions:
+    - type: Available
+      # status is True when the Deployment has the minimum number of available Pods.
+      status: "True"
+      lastUpdateTime: "2024-01-15T10:05:00Z"
+      lastTransitionTime: "2024-01-15T10:05:00Z"
+      reason: MinimumReplicasAvailable
+      message: "Deployment has minimum availability."
+    - type: Progressing
+      # Progressing is True when the Deployment is rolling out or scaling.
+      status: "True"
+      lastUpdateTime: "2024-01-15T10:05:00Z"
+      lastTransitionTime: "2024-01-15T10:00:00Z"
+      reason: NewReplicaSetAvailable
+      message: "ReplicaSet 'my-app-deployment-5f9b4d' has successfully progressed."
+    - type: ReplicaFailure
+      # ReplicaFailure is True if the Deployment cannot create or delete Pods.
+      status: "False"
+      lastUpdateTime: "2024-01-15T10:00:00Z"
+      lastTransitionTime: "2024-01-15T10:00:00Z"
+      reason: ""
+      message: ""
+```
+
+
+---
+
+## 3. StatefulSet
+
+A StatefulSet manages a set of Pods with guaranteed stable identity: each Pod gets a persistent hostname (pod-0, pod-1…), a stable DNS name, and optionally a persistent volume that follows the Pod through rescheduling.
+Use StatefulSets for stateful applications like databases, message queues, and distributed systems that require stable network identity or persistent per-instance storage.
+
+```yaml
+# ============================================================
+# STATEFULSET — Complete Field Reference
+# ============================================================
+
+apiVersion: apps/v1
+
+# kind declares this as a StatefulSet resource.
+# StatefulSets provide stable identities and ordered deployment/scaling.
+kind: StatefulSet
+
+# -------------------------------------------------------
+# METADATA
+# -------------------------------------------------------
+metadata:
+  name: my-db
+  namespace: my-namespace
+  labels:
+    app: my-db
+    component: database
+  annotations:
+    description: "PostgreSQL StatefulSet for production"
+
+# -------------------------------------------------------
+# SPEC
+# -------------------------------------------------------
+spec:
+
+  # serviceName is the name of the headless Service governing this StatefulSet.
+  # REQUIRED. Each Pod gets a DNS record: pod-name.service-name.namespace.svc.cluster.local.
+  serviceName: "my-db"
+
+  # replicas is the desired number of Pod replicas with stable identities.
+  # Pods are named my-db-0, my-db-1, ..., my-db-(N-1).
+  replicas: 3
+
+  # selector must match the labels in spec.template.metadata.labels.
+  # Immutable after creation. Same rules as Deployment selector.
+  selector:
+    matchLabels:
+      app: my-db
+    matchExpressions:
+      - key: component
+        operator: In
+        values:
+          - database
+
+  # ---- UPDATE STRATEGY ----
+
+  # updateStrategy controls how Pods are updated.
+  updateStrategy:
+    # type is RollingUpdate or OnDelete.
+    # RollingUpdate: automatically updates Pods in reverse ordinal order.
+    # OnDelete: Pods are only updated when manually deleted.
+    type: RollingUpdate
+    # type: OnDelete
+
+    # rollingUpdate configures the RollingUpdate strategy.
+    rollingUpdate:
+      # partition divides the StatefulSet: Pods with ordinal >= partition are updated.
+      # Pods with ordinal < partition keep the old spec. Useful for canary rollouts.
+      partition: 0
+      # maxUnavailable is the maximum number of Pods that can be unavailable during update.
+      # Can be absolute number or percentage. Default is 1.
+      maxUnavailable: 1
+
+  # ---- SCALING BEHAVIOR ----
+
+  # podManagementPolicy controls how Pods are created and deleted during scaling.
+  # OrderedReady: pods created/deleted one at a time, each must be Ready first.
+  # Parallel: all pods created/deleted simultaneously (faster, but less safe).
+  podManagementPolicy: OrderedReady
+  # podManagementPolicy: Parallel
+
+  # minReadySeconds is the minimum time a new Pod must be Ready before it's considered available.
+  # Helps ensure stability before a rolling update proceeds to the next Pod.
+  minReadySeconds: 10
+
+  # revisionHistoryLimit is the number of old ControllerRevisions to retain for rollback.
+  # Default is 10.
+  revisionHistoryLimit: 10
+
+  # ---- PERSISTENT VOLUME CLAIM TEMPLATES ----
+
+  # volumeClaimTemplates define PVCs that are created for each Pod replica.
+  # Each Pod gets its own PVC: data-my-db-0, data-my-db-1, etc.
+  # PVCs are NOT deleted when the StatefulSet is deleted — manual cleanup required.
+  volumeClaimTemplates:
+    - metadata:
+        # name is used to generate per-pod PVC names: <name>-<pod-name>.
+        # e.g., "data" + "my-db-0" → PVC named "data-my-db-0".
+        name: data
+        labels:
+          app: my-db
+        annotations:
+          volume.beta.kubernetes.io/storage-class: "fast-ssd"
+      spec:
+        # accessModes controls how the volume can be mounted.
+        # ReadWriteOnce: one node at a time (typical for databases).
+        # ReadOnlyMany: many nodes read-only. ReadWriteMany: many nodes read-write.
+        accessModes:
+          - ReadWriteOnce
+          # - ReadOnlyMany
+          # - ReadWriteMany
+          # - ReadWriteOncePod  # single Pod only (stricter than ReadWriteOnce)
+
+        # storageClassName references a StorageClass for dynamic provisioning.
+        # Leave empty for default StorageClass. Use "-" to disable dynamic provisioning.
+        storageClassName: "fast-ssd"
+
+        # resources specifies the size of the requested PVC.
+        resources:
+          requests:
+            storage: 10Gi
+
+        # selector filters which PVs this PVC can bind to (for static provisioning).
+        # If using dynamic provisioning, leave this empty.
+        selector:
+          matchLabels:
+            type: fast-ssd
+          matchExpressions:
+            - key: performance
+              operator: In
+              values:
+                - high
+
+        # volumeMode controls whether the volume is a filesystem or raw block device.
+        # Filesystem: default, mounted as a directory. Block: raw block device.
+        volumeMode: Filesystem
+        # volumeMode: Block
+
+        # volumeName pins this PVC to a specific PV by name (static binding).
+        # Only for static provisioning; leave empty for dynamic.
+        volumeName: ""
+
+    # Second volume template example (e.g., for WAL logs)
+    - metadata:
+        name: wal
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: "fast-ssd"
+        resources:
+          requests:
+            storage: 5Gi
+
+  # ---- PERSISTENT VOLUME CLAIM RETENTION POLICY ----
+
+  # persistentVolumeClaimRetentionPolicy controls what happens to PVCs when the StatefulSet is deleted or scaled down.
+  # This is a beta feature (Kubernetes 1.27+).
+  persistentVolumeClaimRetentionPolicy:
+    # whenDeleted controls PVC behavior when the StatefulSet is deleted.
+    # Retain: keep PVCs (default). Delete: automatically delete PVCs.
+    whenDeleted: Retain
+    # whenDeleted: Delete
+    # whenScaled controls PVC behavior when the StatefulSet is scaled down.
+    # Retain: keep PVCs of removed Pods. Delete: delete PVCs of removed Pods.
+    whenScaled: Retain
+    # whenScaled: Delete
+
+  # ordinals allows customizing the starting ordinal for Pod naming.
+  # Default is 0. Setting start: 5 names Pods my-db-5, my-db-6, etc.
+  ordinals:
+    start: 0
+
+  # ---- POD TEMPLATE ----
+
+  # template defines the Pod spec for each StatefulSet Pod.
+  # All Pod spec fields apply. See Pod section for full documentation.
+  template:
+    metadata:
+      labels:
+        app: my-db
+        component: database
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
+    spec:
+      serviceAccountName: my-db-sa
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        runAsNonRoot: true
+
+      # initContainers are useful for setting up permissions on mounted PVC directories.
+      initContainers:
+        - name: init-permissions
+          image: busybox:1.35
+          command: ["sh", "-c", "chown -R 999:999 /data /wal"]
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: wal
+              mountPath: /wal
+
+      containers:
+        - name: postgres
+          image: postgres:15.4
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: my-db-secrets
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: my-db-secrets
+                  key: password
+            - name: POSTGRES_DB
+              value: myapp
+            - name: PGDATA
+              value: /data/pgdata
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+
+          lifecycle:
+            preStop:
+              exec:
+                command: ["pg_ctl", "-m", "fast", "stop"]
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: wal
+              mountPath: /wal
+            - name: config
+              mountPath: /etc/postgresql/postgresql.conf
+              subPath: postgresql.conf
+            - name: run-dir
+              mountPath: /var/run/postgresql
+
+        # Metrics sidecar
+        - name: postgres-exporter
+          image: prometheuscommunity/postgres-exporter:v0.13.2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9187
+              protocol: TCP
+          env:
+            - name: DATA_SOURCE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: my-db-secrets
+                  key: data_source_name
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+
+      volumes:
+        - name: config
+          configMap:
+            name: postgres-config
+            defaultMode: 0644
+        - name: run-dir
+          emptyDir: {}
+
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: my-db
+              topologyKey: kubernetes.io/hostname
+
+      tolerations:
+        - key: "database"
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+
+# -------------------------------------------------------
+# STATUS — set by Kubernetes control plane, not by the user
+# -------------------------------------------------------
+status:
+
+  # observedGeneration is the most recent generation the controller has observed.
+  observedGeneration: 2
+
+  # replicas is the total number of non-terminated Pods.
+  replicas: 3
+
+  # readyReplicas is the number of Pods that have passed their readiness probe.
+  readyReplicas: 3
+
+  # currentReplicas is the number of Pods created from the current revision.
+  currentReplicas: 3
+
+  # updatedReplicas is the number of Pods at the latest revision (after a rolling update).
+  updatedReplicas: 3
+
+  # availableReplicas is the number of Pods that have been available for minReadySeconds.
+  availableReplicas: 3
+
+  # currentRevision is the revision of the last successfully applied StatefulSet spec.
+  currentRevision: my-db-7d9b6f9c8
+
+  # updateRevision is the revision the StatefulSet is updating to.
+  # Matches currentRevision when the rollout is complete.
+  updateRevision: my-db-7d9b6f9c8
+
+  # collisionCount is the count of hash collisions for the StatefulSet.
+  collisionCount: 0
+
+  # conditions reflect the current observed state of the StatefulSet.
+  conditions: []
+```
+
+
+---
+
+## 4. Service
+
+A Service provides a stable network endpoint (IP + DNS name) in front of a dynamic set of Pods. It acts as a load balancer and service discovery mechanism within the cluster.
+Services decouple client applications from Pod IP addresses, which change with every Pod restart or rescheduling.
+
+```yaml
+# ============================================================
+# SERVICE — Complete Field Reference
+# ============================================================
+
+apiVersion: v1
+
+# kind declares this as a Service resource.
+# Services provide stable endpoints and load-balancing to Pods.
+kind: Service
+
+# -------------------------------------------------------
+# METADATA
+# -------------------------------------------------------
+metadata:
+  name: my-app-service
+  namespace: my-namespace
+  labels:
+    app: my-app
+    component: frontend
+  annotations:
+    # AWS NLB / ALB annotations (cloud-provider-specific examples)
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-internal: "false"
+    # GCP annotations
+    cloud.google.com/neg: '{"ingress": true}'
+    # Azure annotations
+    service.beta.kubernetes.io/azure-load-balancer-internal: "false"
+    # Prometheus scraping hint
+    prometheus.io/scrape: "true"
+
+# -------------------------------------------------------
+# SPEC
+# -------------------------------------------------------
+spec:
+
+  # type controls how the Service is exposed.
+  # ClusterIP: internal cluster IP only (default).
+  # NodePort: exposes the service on each Node's IP at a static port.
+  # LoadBalancer: provisions an external cloud load balancer.
+  # ExternalName: maps to a DNS name (no proxying).
+  type: ClusterIP
+  # type: NodePort
+  # type: LoadBalancer
+  # type: ExternalName
+
+  # selector determines which Pods receive traffic from this Service.
+  # Pods must have ALL these labels. Omit selector for headless or external services.
+  selector:
+    app: my-app
+    version: "1.0.0"
+
+  # ports defines the port mappings for this Service.
+  # A Service can expose multiple ports.
+  ports:
+    - # name gives a label to this port mapping.
+      # Required when multiple ports are defined. Used by Ingress and other resources.
+      name: http
+      # protocol is TCP, UDP, or SCTP for this port.
+      # Default is TCP.
+      protocol: TCP
+      # protocol: UDP
+      # protocol: SCTP
+      # port is the port exposed by the Service (what clients connect to).
+      # This is the port on the Service's ClusterIP.
+      port: 80
+      # targetPort is the port on the Pod (container) to forward traffic to.
+      # Can be a number or a named port from the container's ports list.
+      targetPort: 8080
+      # targetPort: http  # using named port from container
+      # nodePort is the port on each node for NodePort/LoadBalancer types.
+      # If omitted, a random port from the nodePort range (30000-32767) is assigned.
+      nodePort: 30080  # only used with NodePort or LoadBalancer type
+      # appProtocol hints to proxies and infrastructure about the application protocol.
+      # Common values: http, https, grpc, mongodb, mysql, redis.
+      appProtocol: http
+    - name: https
+      protocol: TCP
+      port: 443
+      targetPort: 8443
+      nodePort: 30443
+      appProtocol: https
+    - name: metrics
+      protocol: TCP
+      port: 9090
+      targetPort: 9090
+
+  # clusterIP is the virtual IP address assigned to the Service.
+  # Set to "None" for a headless Service (DNS returns Pod IPs directly).
+  # Set to "" to auto-assign. Immutable after creation.
+  clusterIP: ""
+  # clusterIP: None  # headless service — no load balancing, DNS returns Pod IPs
+  # clusterIP: 10.96.100.200  # fixed ClusterIP assignment
+
+  # clusterIPs is the list of cluster IPs (for dual-stack IPv4/IPv6).
+  # Follows the order of ipFamilies. Typically managed automatically.
+  clusterIPs:
+    - ""
+    # - "10.96.100.200"   # fixed IPv4
+    # - "fd00::200"       # fixed IPv6
+
+  # ipFamilies defines which IP families (IPv4, IPv6) are used.
+  # SingleStack: one family. PreferDualStack/RequireDualStack: use both.
+  ipFamilies:
+    - IPv4
+    # - IPv6
+  # ipFamilyPolicy controls single-stack vs dual-stack behavior.
+  # SingleStack: one family only. PreferDualStack: use two if available. RequireDualStack: require two.
+  ipFamilyPolicy: SingleStack
+  # ipFamilyPolicy: PreferDualStack
+  # ipFamilyPolicy: RequireDualStack
+
+  # sessionAffinity controls session-based client routing.
+  # None: no affinity (default, round-robin). ClientIP: route same client to same Pod.
+  sessionAffinity: None
+  # sessionAffinity: ClientIP
+
+  # sessionAffinityConfig configures session affinity settings.
+  # Only meaningful when sessionAffinity is ClientIP.
+  sessionAffinityConfig:
+    clientIP:
+      # timeoutSeconds is how long the session affinity sticky session lasts.
+      # Default is 10800 seconds (3 hours). Max is 86400 (1 day).
+      timeoutSeconds: 10800
+
+  # externalTrafficPolicy controls how external traffic is handled.
+  # Cluster: routes to any Pod in the cluster (default, may add extra hop).
+  # Local: routes only to Pods on the same node (preserves client IP, may drop some traffic).
+  externalTrafficPolicy: Cluster
+  # externalTrafficPolicy: Local
+
+  # internalTrafficPolicy controls routing for traffic from within the cluster.
+  # Cluster: route to any Pod. Local: route only to Pods on the same node.
+  internalTrafficPolicy: Cluster
+  # internalTrafficPolicy: Local
+
+  # healthCheckNodePort is the node port used for health checking in LoadBalancer+Local mode.
+  # Auto-assigned if not specified. Only valid when type=LoadBalancer and externalTrafficPolicy=Local.
+  healthCheckNodePort: 31234
+
+  # publishNotReadyAddresses includes Pods that are Not Ready in the Service endpoints.
+  # Useful for headless Services (e.g., StatefulSet) where all Pods should be discoverable.
+  publishNotReadyAddresses: false
+
+  # externalIPs is a list of IP addresses that also route to this Service.
+  # Traffic sent to these IPs on any Service port will be routed to the Service endpoints.
+  externalIPs:
+    - 203.0.113.1
+
+  # loadBalancerIP requests a specific IP for a LoadBalancer-type Service.
+  # Supported only by some cloud providers. Deprecated in favor of loadBalancerClass.
+  loadBalancerIP: "203.0.113.100"
+
+  # loadBalancerSourceRanges restricts which client IPs can access a LoadBalancer Service.
+  # Traffic from IPs outside these ranges is dropped by the cloud load balancer.
+  loadBalancerSourceRanges:
+    - "10.0.0.0/8"
+    - "203.0.113.0/24"
+
+  # loadBalancerClass selects which load balancer controller handles this Service.
+  # When set, only controllers watching this class will provision the load balancer.
+  loadBalancerClass: "service.k8s.aws/nlb"
+
+  # allocateLoadBalancerNodePorts controls whether NodePorts are allocated for LoadBalancer Services.
+  # Default true. Set to false if your cloud LB can talk directly to Pod IPs.
+  allocateLoadBalancerNodePorts: true
+
+  # externalName maps the Service to a DNS name (for type: ExternalName).
+  # DNS lookups return a CNAME record pointing to this value.
+  externalName: "external-db.example.com"
+
+# -------------------------------------------------------
+# STATUS — set by Kubernetes control plane, not by the user
+# -------------------------------------------------------
+status:
+  # loadBalancer contains the status of the provisioned cloud load balancer.
+  # Populated after the cloud controller provisions the LoadBalancer resource.
+  loadBalancer:
+    # ingress is the list of ingress points for the load balancer.
+    ingress:
+      - # ip is the external IP address assigned by the cloud load balancer.
+        ip: "203.0.113.100"
+        # hostname is the DNS hostname assigned by the cloud provider (e.g., AWS ELB).
+        # Some cloud providers return hostname instead of or in addition to IP.
+        hostname: "abc123.us-east-1.elb.amazonaws.com"
+        # ports reflects which ports the load balancer is forwarding.
+        ports:
+          - port: 80
+            protocol: TCP
+            error: ""
+          - port: 443
+            protocol: TCP
+            error: ""
+
+  # conditions reflects the current observed conditions of the Service.
+  conditions: []
+```
+
+
+---
+
+## 5. PersistentVolume (PV)
+
+A PersistentVolume is a cluster-level storage resource provisioned by an admin or dynamically by a StorageClass. It exists independently of any Pod and has its own lifecycle.
+PVs represent actual storage (cloud disk, NFS share, etc.) and are bound to PersistentVolumeClaims which Pods then use.
+
+```yaml
+# ============================================================
+# PERSISTENTVOLUME — Complete Field Reference
+# ============================================================
+
+apiVersion: v1
+
+# kind declares this as a PersistentVolume resource.
+# PVs are cluster-scoped (not namespaced).
+kind: PersistentVolume
+
+# -------------------------------------------------------
+# METADATA
+# -------------------------------------------------------
+metadata:
+  # PVs are cluster-scoped, so there is no namespace field.
+  name: my-pv
+  labels:
+    type: fast-ssd
+    environment: production
+    performance: high
+  annotations:
+    pv.kubernetes.io/provisioned-by: kubernetes.io/aws-ebs
+    volume.kubernetes.io/storage-provisioner: kubernetes.io/aws-ebs
+    volume.beta.kubernetes.io/storage-class: fast-ssd
+
+# -------------------------------------------------------
+# SPEC
+# -------------------------------------------------------
+spec:
+
+  # capacity defines the storage capacity of this PV.
+  # Currently only storage is supported as a resource.
+  capacity:
+    # storage is the size of the PV in a resource quantity format.
+    # Common units: Ki/Mi/Gi/Ti (binary) or K/M/G/T (decimal).
+    storage: 20Gi
+
+  # accessModes defines how the volume can be mounted.
+  # ReadWriteOnce: mounted read-write by a single node.
+  # ReadOnlyMany: mounted read-only by many nodes.
+  # ReadWriteMany: mounted read-write by many nodes (NFS, CephFS, etc.).
+  # ReadWriteOncePod: mounted read-write by a single Pod (Kubernetes 1.22+).
+  accessModes:
+    - ReadWriteOnce
+    # - ReadOnlyMany
+    # - ReadWriteMany
+    # - ReadWriteOncePod
+
+  # volumeMode specifies whether the volume is a filesystem or raw block device.
+  # Filesystem: default, formatted and mounted as a directory.
+  # Block: raw block device, no filesystem layer.
+  volumeMode: Filesystem
+  # volumeMode: Block
+
+  # persistentVolumeReclaimPolicy controls what happens to the PV after its PVC is deleted.
+  # Retain: keep the volume and data (admin must manually reclaim).
+  # Delete: delete the underlying storage resource automatically.
+  # Recycle: scrub (rm -rf) the volume and make it available again (deprecated).
+  persistentVolumeReclaimPolicy: Retain
+  # persistentVolumeReclaimPolicy: Delete
+  # persistentVolumeReclaimPolicy: Recycle
+
+  # storageClassName links this PV to a StorageClass.
+  # A PVC with the same storageClassName can bind to this PV.
+  # Use "" for PVs that should only bind to PVCs with no storageClassName.
+  storageClassName: fast-ssd
+
+  # mountOptions are additional options passed to the mount command.
+  # Supported options depend on the volume type and OS. Invalid options cause mount failure.
+  mountOptions:
+    - hard
+    - nfsvers=4.1
+    - rsize=1048576
+    - wsize=1048576
+
+  # volumeAttributesClassName references a VolumeAttributesClass for modifiable volume attributes.
+  # This is an alpha feature for changing volume properties (e.g., IOPS) without recreation.
+  # volumeAttributesClassName: high-iops
+
+  # claimRef pre-binds this PV to a specific PVC.
+  # When set, only the referenced PVC can bind to this PV. Used for static provisioning.
+  claimRef:
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    name: my-pvc
+    namespace: my-namespace
+    # uid is the UID of the PVC. Set this to enforce an exact match.
+    uid: ""
+    # resourceVersion is populated by the server. Do not set manually.
+    resourceVersion: ""
+
+  # nodeAffinity constrains which nodes can use this PV.
+  # Required for local volumes; optional for remote volumes.
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - node-1
+                - node-2
+
+  # ---- VOLUME SOURCE (choose exactly ONE) ----
+  # The following section shows all supported volume sources.
+  # In practice, include ONLY the one source that matches your storage backend.
+
+  # awsElasticBlockStore mounts an AWS EBS volume.
+  # DEPRECATED in Kubernetes 1.17+ in favor of the EBS CSI driver.
+  awsElasticBlockStore:
+    # volumeID is the EBS volume ID (e.g., vol-0a1b2c3d4e5f).
+    # The EBS volume must exist in the same AWS availability zone as the node.
+    volumeID: "vol-0a1b2c3d4e5f"
+    # fsType is the filesystem type (ext4, xfs, etc.).
+    fsType: ext4
+    # partition is the partition number to mount (0 = entire disk).
+    partition: 0
+    # readOnly forces the volume to be mounted read-only.
+    readOnly: false
+
+  # gcePersistentDisk mounts a GCE Persistent Disk.
+  # DEPRECATED in favor of the GCE PD CSI driver.
+  # gcePersistentDisk:
+  #   pdName: "my-gce-disk"
+  #   fsType: ext4
+  #   partition: 0
+  #   readOnly: false
+
+  # azureDisk mounts an Azure Managed Disk.
+  # DEPRECATED in favor of the Azure Disk CSI driver.
+  # azureDisk:
+  #   diskName: "my-azure-disk"
+  #   diskURI: "/subscriptions/.../resourceGroups/.../providers/Microsoft.Compute/disks/my-disk"
+  #   kind: Managed
+  #   # kind: Shared
+  #   # kind: Dedicated
+  #   cachingMode: ReadWrite
+  #   # cachingMode: ReadOnly
+  #   # cachingMode: None
+  #   fsType: ext4
+  #   readOnly: false
+
+  # azureFile mounts an Azure File share via SMB.
+  # azureFile:
+  #   secretName: "azure-secret"
+  #   secretNamespace: "my-namespace"
+  #   shareName: "myshare"
+  #   readOnly: false
+
+  # nfs mounts an NFS share.
+  # Requires an NFS server reachable from all nodes.
+  # nfs:
+  #   server: nfs-server.example.com
+  #   path: /exports/myapp
+  #   readOnly: false
+
+  # iscsi mounts an iSCSI target.
+  # iscsi:
+  #   targetPortal: "10.0.2.15:3260"
+  #   iqn: "iqn.2001-04.com.example:storage.kube.sys1.xyz"
+  #   lun: 0
+  #   iscsiInterface: default
+  #   fsType: ext4
+  #   readOnly: false
+  #   portals:
+  #     - "10.0.2.16:3260"
+  #   chapAuthDiscovery: false
+  #   chapAuthSession: false
+  #   secretRef:
+  #     name: chap-secret
+  #     namespace: my-namespace
+  #   initiatorName: ""
+
+  # cephfs mounts a CephFS filesystem.
+  # cephfs:
+  #   monitors:
+  #     - "10.16.154.78:6789"
+  #     - "10.16.154.82:6789"
+  #   path: /cephfs
+  #   user: admin
+  #   secretFile: /etc/ceph/admin.secret
+  #   secretRef:
+  #     name: ceph-secret
+  #   readOnly: false
+
+  # rbd mounts a Rados Block Device (Ceph RBD).
+  # rbd:
+  #   monitors:
+  #     - "10.16.154.78:6789"
+  #   image: "foo"
+  #   pool: rbd
+  #   user: admin
+  #   keyring: /etc/ceph/keyring
+  #   secretRef:
+  #     name: ceph-secret
+  #   fsType: ext4
+  #   readOnly: false
+
+  # local mounts a local disk directly on a specific node.
+  # Must be combined with nodeAffinity to constrain which node this PV is available on.
+  # local:
+  #   path: /mnt/disks/ssd1
+  #   fsType: ext4
+
+  # hostPath is a directory on the host node (single-node clusters and testing only).
+  # hostPath:
+  #   path: /mnt/data
+  #   type: Directory
+
+  # fc mounts a Fibre Channel volume.
+  # fc:
+  #   targetWWNs:
+  #     - "500a0982991b8dc5"
+  #   lun: 2
+  #   fsType: ext4
+  #   readOnly: false
+  #   wwids: []
+
+  # flexVolume uses a legacy FlexVolume plugin (deprecated, use CSI instead).
+  # flexVolume:
+  #   driver: "kubernetes.io/lvm"
+  #   fsType: ext4
+  #   secretRef:
+  #     name: flex-secret
+  #   readOnly: false
+  #   options:
+  #     size: 200Mi
+  #     volumegroup: kube_vg
+
+  # csi mounts a volume from a CSI driver (the modern, recommended approach).
+  # csi:
+  #   driver: ebs.csi.aws.com
+  #   volumeHandle: "vol-0a1b2c3d4e5f"
+  #   fsType: ext4
+  #   readOnly: false
+  #   volumeAttributes:
+  #     type: gp3
+  #     iopsPerGB: "50"
+  #   controllerExpandSecretRef:
+  #     name: ebs-secret
+  #     namespace: kube-system
+  #   controllerPublishSecretRef:
+  #     name: ebs-secret
+  #     namespace: kube-system
+  #   nodeExpandSecretRef:
+  #     name: ebs-secret
+  #     namespace: kube-system
+  #   nodePublishSecretRef:
+  #     name: ebs-secret
+  #     namespace: kube-system
+  #   nodeStageSecretRef:
+  #     name: ebs-secret
+  #     namespace: kube-system
+
+  # portworxVolume mounts a Portworx volume.
+  # portworxVolume:
+  #   volumeID: "pxvol"
+  #   fsType: ext4
+  #   readOnly: false
+
+  # quobyte mounts a Quobyte volume.
+  # quobyte:
+  #   registry: "registry:7861"
+  #   volume: "testVolume"
+  #   readOnly: false
+  #   user: serviceaccount
+  #   group: servicegroup
+  #   tenant: ""
+
+  # storageos mounts a StorageOS volume.
+  # storageos:
+  #   volumeName: "my-vol"
+  #   volumeNamespace: "my-namespace"
+  #   fsType: ext4
+  #   readOnly: false
+  #   secretRef:
+  #     name: storageos-secret
+
+  # vsphereVolume mounts a vSphere VMDK volume.
+  # DEPRECATED in favor of the vSphere CSI driver.
+  # vsphereVolume:
+  #   volumePath: "[DatastoreName] volumes/myDisk"
+  #   fsType: ext4
+  #   storagePolicyName: ""
+  #   storagePolicyID: ""
+
+  # photonPersistentDisk mounts a PhotonController disk.
+  # photonPersistentDisk:
+  #   pdID: "4"
+  #   fsType: ext4
+
+  # scaleIO mounts a ScaleIO volume (deprecated).
+  # scaleIO:
+  #   gateway: https://localhost:443/api
+  #   system: scaleio
+  #   secretRef:
+  #     name: sio-secret
+  #   sslEnabled: true
+  #   protectionDomain: pd01
+  #   storagePool: sp01
+  #   storageMode: ThinProvisioned
+  #   volumeName: vol-0
+  #   fsType: xfs
+  #   readOnly: false
+
+# -------------------------------------------------------
+# STATUS — set by Kubernetes control plane, not by the user
+# -------------------------------------------------------
+status:
+
+  # phase reflects the current lifecycle phase of the PV.
+  # Available: not yet bound to a PVC.
+  # Bound: bound to a PVC.
+  # Released: PVC was deleted, PV has not been reclaimed yet.
+  # Failed: automatic reclamation failed.
+  phase: Bound
+  # phase: Available
+  # phase: Released
+  # phase: Failed
+
+  # message is a human-readable message describing why the PV is in this phase.
+  message: ""
+
+  # reason is a brief reason why the PV is in this phase.
+  reason: ""
+
+  # lastPhaseTransitionTime is the timestamp of the last phase change.
+  lastPhaseTransitionTime: "2024-01-15T10:00:00Z"
+```
+
+
+---
+
+## 6. PersistentVolumeClaim (PVC)
+
+A PersistentVolumeClaim is a request for storage by a user or Pod. It is the consumer-side counterpart to a PersistentVolume — the PVC requests capacity and access modes, and Kubernetes binds it to a matching PV.
+PVCs are namespaced and can be referenced by Pods in the same namespace via spec.volumes[].persistentVolumeClaim.
+
+```yaml
+# ============================================================
+# PERSISTENTVOLUMECLAIM — Complete Field Reference
+# ============================================================
+
+apiVersion: v1
+
+# kind declares this as a PersistentVolumeClaim resource.
+# PVCs are namespaced resources — they belong to a specific namespace.
+kind: PersistentVolumeClaim
+
+# -------------------------------------------------------
+# METADATA
+# -------------------------------------------------------
+metadata:
+  name: my-pvc
+  namespace: my-namespace
+  labels:
+    app: my-app
+    component: storage
+  annotations:
+    volume.beta.kubernetes.io/storage-provisioner: ebs.csi.aws.com
+    volume.kubernetes.io/storage-provisioner: ebs.csi.aws.com
+    volume.kubernetes.io/selected-node: node-1
+  finalizers:
+    # kubernetes.io/pvc-protection prevents accidental deletion of PVCs in use by Pods.
+    # This finalizer is added automatically by the PVC protection controller.
+    - kubernetes.io/pvc-protection
+
+# -------------------------------------------------------
+# SPEC
+# -------------------------------------------------------
+spec:
+
+  # accessModes defines how this PVC requires the volume to be mounted.
+  # Must be a subset of what the target PV supports.
+  # ReadWriteOnce: single node, read-write.
+  # ReadOnlyMany: multiple nodes, read-only.
+  # ReadWriteMany: multiple nodes, read-write (requires NFS, CephFS, etc.).
+  # ReadWriteOncePod: single Pod read-write (Kubernetes 1.22+, CSI only).
+  accessModes:
+    - ReadWriteOnce
+    # - ReadOnlyMany
+    # - ReadWriteMany
+    # - ReadWriteOncePod
+
+  # volumeMode specifies filesystem or block mode.
+  # Must match the PV's volumeMode.
+  # Filesystem: default. Block: raw block device access.
+  volumeMode: Filesystem
+  # volumeMode: Block
+
+  # resources specifies the minimum storage required.
+  # For volume expansion, increase requests.storage and the PV/StorageClass must support it.
+  resources:
+    # requests specifies the minimum storage capacity needed.
+    # The bound PV must have at least this much capacity.
+    requests:
+      storage: 10Gi
+    # limits specify the maximum storage capacity (rarely used, not enforced by all providers).
+    limits:
+      storage: 20Gi
+
+  # storageClassName references the StorageClass used for dynamic provisioning.
+  # If set, a new PV is dynamically provisioned using this class.
+  # If set to "" (empty string), disables dynamic provisioning (must bind to unclassed PV).
+  # If unset, the default StorageClass is used.
+  storageClassName: fast-ssd
+
+  # volumeName pins the PVC to a specific existing PV by name (static binding).
+  # Only for static provisioning. The named PV must exist and be compatible.
+  volumeName: my-pv
+
+  # selector filters which PVs can be bound to this PVC.
+  # If volumeName is set, selector is redundant.
+  selector:
+    # matchLabels requires exact label matches on candidate PVs.
+    matchLabels:
+      type: fast-ssd
+      performance: high
+    # matchExpressions allows more complex filtering using operators.
+    matchExpressions:
+      - key: environment
+        operator: In
+        values:
+          - production
+
+  # dataSource specifies a source for populating this volume's initial data.
+  # Used for cloning from existing PVCs or restoring from VolumeSnapshots.
+  dataSource:
+    # apiGroup is the API group of the source resource.
+    # Empty for PVCs (core API). "snapshot.storage.k8s.io" for VolumeSnapshots.
+    apiGroup: snapshot.storage.k8s.io
+    # kind is the type of the source resource.
+    # PersistentVolumeClaim: clone from another PVC.
+    # VolumeSnapshot: restore from a snapshot.
+    kind: VolumeSnapshot
+    # name is the name of the source object in the same namespace.
+    name: my-snapshot
+
+  # dataSourceRef is like dataSource but supports cross-namespace sources (alpha).
+  # Allows referencing sources in other namespaces when allowed by a ReferenceGrant.
+  dataSourceRef:
+    apiGroup: snapshot.storage.k8s.io
+    kind: VolumeSnapshot
+    name: my-snapshot
+    # namespace allows cross-namespace references (Kubernetes 1.26+).
+    namespace: snapshot-namespace
+
+  # volumeAttributesClassName references a VolumeAttributesClass for modifiable attributes.
+  # Alpha feature for dynamically changing storage attributes (IOPS, throughput, etc.).
+  # volumeAttributesClassName: high-iops
+
+# -------------------------------------------------------
+# STATUS — set by Kubernetes control plane, not by the user
+# -------------------------------------------------------
+status:
+
+  # phase reflects the current lifecycle phase of the PVC.
+  # Pending: not yet bound to a PV.
+  # Bound: successfully bound to a PV.
+  # Lost: the bound PV no longer exists (data may be lost or inaccessible).
+  phase: Bound
+  # phase: Pending
+  # phase: Lost
+
+  # accessModes reflects the access modes of the bound PV.
+  # May differ slightly from spec if the PV supports a superset.
+  accessModes:
+    - ReadWriteOnce
+
+  # capacity reflects the actual capacity of the bound PV.
+  # May be larger than what was requested in spec.resources.requests.storage.
+  capacity:
+    storage: 20Gi
+
+  # conditions reflects the current state of the PVC.
+  conditions:
+    - # type is the condition type.
+      # Resizing: a resize operation is in progress.
+      # FileSystemResizePending: resize complete at block layer, FS resize pending.
+      type: Resizing
+      # status is True, False, or Unknown.
+      status: "False"
+      lastProbeTime: null
+      lastTransitionTime: "2024-01-15T10:00:00Z"
+      reason: ""
+      message: ""
+    - type: FileSystemResizePending
+      status: "False"
+      lastTransitionTime: "2024-01-15T10:00:00Z"
+
+  # allocatedResources reflects the resources allocated to this PVC after binding.
+  # May differ from requested resources if the PV was larger.
+  allocatedResources:
+    storage: 20Gi
+
+  # resizeStatus reflects the status of a volume resize operation.
+  # ControllerExpansionPending, ControllerExpansionInProgress, NodeExpansionPending,
+  # NodeExpansionInProgress, NodeExpansionFailed, InfeasibleError, OperationalError.
+  resizeStatus: ""
+
+  # currentVolumeAttributesClassName shows which VolumeAttributesClass is currently applied.
+  currentVolumeAttributesClassName: ""
+
+  # modifyVolumeStatus shows details of a pending VolumeAttributesClass modification.
+  modifyVolumeStatus:
+    targetVolumeAttributesClassName: ""
+    status: ""
+```
+
+
+---
+
+## 7. Node
+
+A Node represents a worker machine in the Kubernetes cluster — either a physical host or a virtual machine. Nodes are managed by the control plane and host the Pods that run application workloads.
+Node objects are typically auto-created by the cloud provider or kubelet, but can be manually created for bare-metal clusters. Operators primarily interact with Nodes to apply taints, labels, or cordons.
+
+```yaml
+# ============================================================
+# NODE — Complete Field Reference
+# ============================================================
+
+apiVersion: v1
+
+# kind declares this as a Node resource.
+# Nodes are cluster-scoped (not namespaced).
+kind: Node
+
+# -------------------------------------------------------
+# METADATA
+# -------------------------------------------------------
+metadata:
+  # name is the hostname of the node, matching the OS hostname.
+  # This is used by the kubelet to register itself with the API server.
+  name: node-1.us-east-1.example.com
+
+  # Nodes are cluster-scoped — no namespace field.
+
+  labels:
+    # Kubernetes automatically adds many well-known labels to nodes.
+    # You can also add custom labels for nodeSelector and affinity rules.
+
+    # Standard node labels (added by kubelet/cloud-controller-manager):
+    kubernetes.io/hostname: node-1
+    kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+
+    # Topology labels (added by cloud providers):
+    topology.kubernetes.io/region: us-east-1
+    topology.kubernetes.io/zone: us-east-1a
+
+    # Node role labels:
+    node-role.kubernetes.io/worker: ""
+    # node-role.kubernetes.io/control-plane: ""
+    # node-role.kubernetes.io/master: ""  # deprecated
+
+    # Instance type and cloud labels:
+    node.kubernetes.io/instance-type: m5.xlarge
+    beta.kubernetes.io/instance-type: m5.xlarge   # deprecated alias
+
+    # Custom labels (user-defined):
+    disktype: ssd
+    environment: production
+    team: platform
+
+  annotations:
+    # Standard annotations added by kubelet or cloud provider:
+    node.alpha.kubernetes.io/ttl: "0"
+    volumes.kubernetes.io/controller-managed-attach-detach: "true"
+    alpha.kubernetes.io/provided-node-ip: "10.0.1.5"
+
+    # Cloud provider annotations:
+    node.kubernetes.io/cloud-resource-id: "/subscriptions/.../virtualMachines/node-1"
+
+    # Custom annotations:
+    cluster.example.com/rack: "rack-17"
+    maintenance.example.com/scheduled: "2024-02-01"
+
+# -------------------------------------------------------
+# SPEC
+# -------------------------------------------------------
+spec:
+
+  # podCIDR is the IPv4 CIDR block assigned to this node for Pod IPs.
+  # Set by the controller-manager or CNI plugin. Pods on this node get IPs from this range.
+  podCIDR: "192.168.1.0/24"
+
+  # podCIDRs is the list of CIDR blocks for dual-stack IPv4/IPv6.
+  # First entry must match podCIDR.
+  podCIDRs:
+    - "192.168.1.0/24"
+    - "fd00:10:96::/112"
+
+  # providerID is the unique cloud provider ID for this node.
+  # Format is cloud-provider://region/instanceID. Used by cloud-controller-manager.
+  providerID: "aws:///us-east-1a/i-0a1b2c3d4e5f67890"
+
+  # unschedulable marks the node as unschedulable (cordoned).
+  # When true, no new Pods will be scheduled here (existing Pods continue to run).
+  # Equivalent to running: kubectl cordon <node-name>
+  unschedulable: false
+
+  # taints repel Pods that don't have matching tolerations.
+  # Commonly used to reserve nodes for specific workloads or to mark degraded nodes.
+  taints:
+    - # key is the taint key label.
+      # Pods need a toleration matching this key to be scheduled here.
+      key: "dedicated"
+      # value is the taint value. Only meaningful when effect is NoSchedule or PreferNoSchedule.
+      value: "gpu"
+      # effect defines what happens to Pods without a matching toleration.
+      # NoSchedule: Pods not tolerated won't be scheduled here.
+      # PreferNoSchedule: Pods not tolerated are preferably not scheduled here (soft).
+      # NoExecute: Pods not tolerated are evicted if already running here.
+      effect: NoSchedule
+      # effect: PreferNoSchedule
+      # effect: NoExecute
+      # timeAdded is the timestamp when the NoExecute taint was added.
+      # Used to compute tolerationSeconds windows for eviction.
+      timeAdded: null
+
+    - key: "node.kubernetes.io/not-ready"
+      effect: NoExecute
+      timeAdded: null
+
+    - key: "node.kubernetes.io/unreachable"
+      effect: NoExecute
+      timeAdded: null
+
+    - key: "node.kubernetes.io/disk-pressure"
+      effect: NoSchedule
+
+    - key: "node.kubernetes.io/memory-pressure"
+      effect: NoSchedule
+
+    - key: "node.kubernetes.io/pid-pressure"
+      effect: NoSchedule
+
+    - key: "node.kubernetes.io/network-unavailable"
+      effect: NoSchedule
+
+    - key: "node.kubernetes.io/unschedulable"
+      effect: NoSchedule
+
+  # configSource is used by the Dynamic Kubelet Config feature (deprecated in 1.22, removed in 1.24).
+  # It referenced a ConfigMap containing kubelet configuration.
+  # configSource:
+  #   configMap:
+  #     name: my-kubelet-config
+  #     namespace: kube-system
+  #     kubeletConfigKey: kubelet
+
+# -------------------------------------------------------
+# STATUS — set by Kubernetes control plane, not by the user
+# -------------------------------------------------------
+status:
+
+  # capacity describes the total resources of this node.
+  # These are the raw values before accounting for system/kube-reserved allocations.
+  capacity:
+    # cpu is the total CPU capacity in millicores or cores.
+    # This reflects the physical or virtual CPU count of the node.
+    cpu: "4"
+    # memory is the total RAM in bytes (or human-readable units).
+    memory: "16Gi"
+    # pods is the maximum number of Pods that can run on this node.
+    # Controlled by --max-pods kubelet flag (default 110).
+    pods: "110"
+    # ephemeral-storage is the total local ephemeral storage capacity.
+    # Covers emptyDir, container logs, and writable container layers.
+    ephemeral-storage: "200Gi"
+    # hugepages-2Mi is the total 2Mi huge pages available.
+    hugepages-2Mi: "0"
+    # hugepages-1Gi is the total 1Gi huge pages available.
+    hugepages-1Gi: "0"
+
+  # allocatable describes the resources available for Pods after system reservations.
+  # This is what the scheduler uses: allocatable = capacity - system-reserved - kube-reserved - eviction-threshold.
+  allocatable:
+    cpu: "3800m"
+    memory: "14Gi"
+    pods: "110"
+    ephemeral-storage: "180Gi"
+    hugepages-2Mi: "0"
+    hugepages-1Gi: "0"
+
+  # conditions reports the health of various node subsystems.
+  conditions:
+    - # type is the condition type.
+      # Ready: the node is healthy and ready to accept Pods.
+      type: Ready
+      # status is True, False, or Unknown.
+      # True = condition is active. False = condition not met. Unknown = controller lost contact.
+      status: "True"
+      lastHeartbeatTime: "2024-01-15T12:00:00Z"
+      lastTransitionTime: "2024-01-14T08:00:00Z"
+      reason: KubeletReady
+      message: "kubelet is posting ready status"
+
+    - # MemoryPressure is True when the node has low memory.
+      # When True, the scheduler will not schedule new Pods on this node.
+      type: MemoryPressure
+      status: "False"
+      lastHeartbeatTime: "2024-01-15T12:00:00Z"
+      lastTransitionTime: "2024-01-14T08:00:00Z"
+      reason: KubeletHasSufficientMemory
+      message: "kubelet has sufficient memory available"
+
+    - # DiskPressure is True when the node's disk capacity is running low.
+      # Triggers eviction of Pods based on eviction policy.
+      type: DiskPressure
+      status: "False"
+      lastHeartbeatTime: "2024-01-15T12:00:00Z"
+      lastTransitionTime: "2024-01-14T08:00:00Z"
+      reason: KubeletHasNoDiskPressure
+      message: "kubelet has no disk pressure"
+
+    - # PIDPressure is True when the node has too many running processes.
+      # Triggers eviction when the node is approaching its PID limit.
+      type: PIDPressure
+      status: "False"
+      lastHeartbeatTime: "2024-01-15T12:00:00Z"
+      lastTransitionTime: "2024-01-14T08:00:00Z"
+      reason: KubeletHasSufficientPID
+      message: "kubelet has sufficient PID available"
+
+    - # NetworkUnavailable is True when the node's network is not properly configured.
+      # Set by the CNI plugin; True means Pods cannot communicate.
+      type: NetworkUnavailable
+      status: "False"
+      lastHeartbeatTime: "2024-01-15T10:00:00Z"
+      lastTransitionTime: "2024-01-14T08:00:00Z"
+      reason: FlannelIsUp
+      message: "Flannel is running on this node"
+
+  # addresses is the list of network addresses assigned to this node.
+  addresses:
+    - # type classifies the address.
+      # InternalIP: the node's internal cluster IP (used by Pods and other nodes).
+      type: InternalIP
+      address: "10.0.1.5"
+    - # ExternalIP: publicly routable IP address.
+      type: ExternalIP
+      address: "54.23.45.67"
+    - # InternalDNS: internal DNS name for the node.
+      type: InternalDNS
+      address: "node-1.us-east-1.compute.internal"
+    - # ExternalDNS: externally resolvable DNS name.
+      type: ExternalDNS
+      address: "ec2-54-23-45-67.us-east-1.compute.amazonaws.com"
+    - # Hostname: the node's OS-level hostname.
+      type: Hostname
+      address: "node-1"
+
+  # daemonEndpoints describes the kubelet's listening endpoints.
+  daemonEndpoints:
+    # kubeletEndpoint is the port on which the kubelet listens.
+    # Used by the API server for log streaming, exec, and port-forward.
+    kubeletEndpoint:
+      Port: 10250
+
+  # nodeInfo provides identifying information about the node's OS and runtime.
+  nodeInfo:
+    # machineID is a unique identifier for the machine, sourced from /etc/machine-id.
+    machineID: "abc1234def5678"
+    # systemUUID is the UUID of the system, typically from BIOS/UEFI.
+    systemUUID: "00000000-0000-0000-0000-000000000001"
+    # bootID changes every time the node reboots. Used for detecting restarts.
+    bootID: "xyz9876uvw5432"
+    # kernelVersion is the Linux kernel version running on the node.
+    kernelVersion: "5.15.0-1033-aws"
+    # osImage is the human-readable OS distribution name.
+    osImage: "Ubuntu 22.04.3 LTS"
+    # containerRuntimeVersion is the container runtime version.
+    # Format: runtime://version (e.g., containerd://1.6.21).
+    containerRuntimeVersion: "containerd://1.6.21"
+    # kubeletVersion is the version of the kubelet running on this node.
+    kubeletVersion: "v1.28.2"
+    # kubeProxyVersion is the version of kube-proxy running on this node.
+    kubeProxyVersion: "v1.28.2"
+    # operatingSystem is the OS type, typically "linux" or "windows".
+    operatingSystem: linux
+    # architecture is the CPU architecture (amd64, arm64, etc.).
+    architecture: amd64
+
+  # images is a list of container images cached on this node.
+  # Used by the scheduler to prefer nodes that already have needed images.
+  images:
+    - # names is the list of tags/digests for this image.
+      names:
+        - "nginx@sha256:abc123..."
+        - "nginx:1.25.3"
+      # sizeBytes is the size of the image on disk in bytes.
+      sizeBytes: 70234456
+    - names:
+        - "postgres@sha256:def456..."
+        - "postgres:15.4"
+      sizeBytes: 150456789
+
+  # volumesInUse is the list of PVs mounted on this node.
+  # Used by the Attach/Detach controller to track volumes.
+  volumesInUse:
+    - kubernetes.io/aws-ebs/vol-0a1b2c3d4e5f
+
+  # volumesAttached is the list of volumes currently attached to this node.
+  # Reflects the actual attach state as reported by the volume plugin.
+  volumesAttached:
+    - name: kubernetes.io/aws-ebs/vol-0a1b2c3d4e5f
+      devicePath: /dev/xvdba
+
+  # config reflects the kubelet configuration for this node (Dynamic Kubelet Config, deprecated).
+  config:
+    active:
+      configMap:
+        name: my-kubelet-config
+        namespace: kube-system
+        uid: "abc123"
+        resourceVersion: "12345"
+        kubeletConfigKey: kubelet
+    assigned:
+      configMap:
+        name: my-kubelet-config
+        namespace: kube-system
+        uid: "abc123"
+        resourceVersion: "12345"
+        kubeletConfigKey: kubelet
+    lastKnownGood:
+      configMap:
+        name: my-kubelet-config
+        namespace: kube-system
+        uid: "abc123"
+        resourceVersion: "12345"
+        kubeletConfigKey: kubelet
+    error: ""
+
+  # runtimeHandlers lists the available runtime handlers for this node.
+  # Used with RuntimeClass to select sandbox types (e.g., runc, runsc/gVisor, kata-containers).
+  runtimeHandlers:
+    - name: runc
+      features:
+        recursiveReadOnlyMounts: true
+        userNamespaces: true
+    - name: runsc
+      features:
+        recursiveReadOnlyMounts: false
+        userNamespaces: false
+```
+
+---
+
+## Quick Reference: Field Ownership Summary
+
+| Field | Set by | Notes |
+|---|---|---|
+| `metadata.*` | User | Set at creation; some fields auto-populated by server |
+| `spec.*` | User | Desired state — what you define |
+| `status.*` | Control plane | Never set manually — read-only for operators |
+| `metadata.resourceVersion` | API server | Changes on every update; used for optimistic concurrency |
+| `metadata.uid` | API server | Unique object ID; never set manually |
+| `metadata.generation` | API server | Incremented on spec changes |
+| `metadata.creationTimestamp` | API server | Set at creation |
+| `metadata.managedFields` | API server | Set by server-side apply |
+| Node taints | User or Node Lifecycle Controller | Can be manually added/removed |
+| PV `claimRef` | PVC binding controller | Set when PVC binds; can be pre-set for static binding |
+
+---
+
+*Generated as a complete Kubernetes YAML field reference. All fields sourced from the Kubernetes API specification.*
